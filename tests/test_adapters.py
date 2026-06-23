@@ -276,6 +276,17 @@ class TestGitHooksAdapter:
 
         assert count == 0
 
+    def test_ingest_commits_passes_since_to_git(self, store):
+        from kindex.adapters.git_hooks import ingest_recent_commits
+
+        mock_result = MagicMock(returncode=0, stdout="")
+        with patch("subprocess.run", return_value=mock_result) as run:
+            ingest_recent_commits(
+                store, "/tmp/fake-repo", since="2026-06-10T00:00:00Z"
+            )
+
+        assert "--since=2026-06-10T00:00:00Z" in run.call_args.args[0]
+
     def test_ingest_commits_git_not_available(self, store):
         """Should return 0 if git is not available."""
         from kindex.adapters.git_hooks import ingest_recent_commits

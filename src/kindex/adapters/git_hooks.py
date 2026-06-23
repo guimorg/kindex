@@ -122,14 +122,18 @@ def uninstall_hooks(repo_path: str | Path) -> list[str]:
 
 
 def ingest_recent_commits(store: "Store", repo_path: str | Path = ".",
-                          limit: int = 20, verbose: bool = False) -> int:
+                          limit: int = 20, since: str | None = None,
+                          verbose: bool = False) -> int:
     """Ingest recent git commits from a local repository."""
     repo_path = Path(repo_path).resolve()
 
     try:
+        command = ["git", "-C", str(repo_path), "log", f"--max-count={limit}"]
+        if since:
+            command.append(f"--since={since}")
+        command.append("--pretty=format:%H|%s|%an|%aI")
         result = subprocess.run(
-            ["git", "-C", str(repo_path), "log", f"--max-count={limit}",
-             "--pretty=format:%H|%s|%an|%aI"],
+            command,
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
@@ -205,7 +209,7 @@ class CommitsAdapter:
     def ingest(self, store, *, limit=50, since=None, verbose=False, **kwargs):
         repo_path = kwargs.get("repo_path", ".")
         created = ingest_recent_commits(
-            store, repo_path=repo_path, limit=limit, verbose=verbose
+            store, repo_path=repo_path, limit=limit, since=since, verbose=verbose
         )
         return IngestResult(created=created)
 
