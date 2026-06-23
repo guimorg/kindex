@@ -25,7 +25,9 @@ class CodexSessionsAdapter:
         from ..ingest import scan_codex_sessions
 
         cfg = kwargs.get("_config") or load_config()
-        created = scan_codex_sessions(cfg, store, limit=limit, verbose=verbose)
+        created = scan_codex_sessions(
+            cfg, store, limit=limit, since=since, verbose=verbose
+        )
         return IngestResult(created=created)
 
 

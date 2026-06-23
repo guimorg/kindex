@@ -1,6 +1,8 @@
 """Tests for ingestion — project scanning, .conv files, session learning."""
 
 import json
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -175,7 +177,89 @@ class TestScanSessions:
 
         sessions = s.all_nodes(node_type="session")
         assert len(sessions) >= 1
+        assert sessions[0]["prov_when"]
         s.close()
+
+    def test_claude_sessions_filter_by_source_time_before_limit(self, tmp_path):
+        data_dir = tmp_path / "data"
+        claude_dir = tmp_path / "claude"
+        projects_dir = claude_dir / "projects" / "project"
+        projects_dir.mkdir(parents=True)
+        content = json.dumps(
+            {
+                "role": "assistant",
+                "content": "Kindex memory preserves source event chronology. Ambient Structure Discovery uses session traces.",
+            }
+        )
+        old = projects_dir / "old-session.jsonl"
+        new = projects_dir / "new-session.jsonl"
+        old.write_text(content)
+        new.write_text(content)
+        old_time = datetime(2026, 5, 1, tzinfo=timezone.utc).timestamp()
+        new_time = datetime(2026, 6, 20, tzinfo=timezone.utc).timestamp()
+        os.utime(old, (old_time, old_time))
+        os.utime(new, (new_time, new_time))
+        cfg = Config(data_dir=str(data_dir), claude_dir=str(claude_dir))
+        store = Store(cfg)
+
+        from kindex.ingest import scan_sessions
+
+        count = scan_sessions(cfg, store, limit=1, since="2026-06-01")
+        sessions = store.all_nodes(node_type="session")
+
+        assert count == 1
+        assert sessions[0]["id"] == "session-new-session"
+        assert sessions[0]["prov_when"].startswith("2026-06-20T00:00:00")
+        store.close()
+
+    def test_codex_invalid_metadata_timestamp_falls_back_to_mtime(self, tmp_path):
+        from kindex.session_sources import codex_event_time
+
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"timestamp": "not-a-timestamp"},
+                }
+            )
+        )
+        modified = datetime(2026, 6, 21, 12, 34, tzinfo=timezone.utc)
+        os.utime(session_file, (modified.timestamp(), modified.timestamp()))
+
+        assert codex_event_time(session_file) == modified
+
+    def test_session_source_filter_runs_before_limit(self, tmp_path):
+        from kindex.session_sources import recent_session_files
+
+        old = tmp_path / "old.jsonl"
+        new = tmp_path / "new.jsonl"
+        old.touch()
+        new.touch()
+        old_time = datetime(2026, 5, 1, tzinfo=timezone.utc).timestamp()
+        new_time = datetime(2026, 6, 20, tzinfo=timezone.utc).timestamp()
+        os.utime(old, (old_time, old_time))
+        os.utime(new, (new_time, new_time))
+
+        files = recent_session_files(tmp_path, since="2026-06-01", limit=1)
+
+        assert [path for path, _ in files] == [new]
+
+    def test_session_source_filter_uses_millisecond_contract(self, tmp_path):
+        from kindex.session_sources import recent_session_files
+
+        session = tmp_path / "session.jsonl"
+        session.touch()
+        event_time = datetime(2026, 6, 20, 0, 0, 0, 600, tzinfo=timezone.utc)
+
+        files = recent_session_files(
+            tmp_path,
+            event_time=lambda _: event_time,
+            since="2026-06-20T00:00:00.000900Z",
+            limit=1,
+        )
+
+        assert files == [(session, event_time.replace(microsecond=1_000))]
 
     def test_idempotent_sessions(self, tmp_path):
         data_dir = tmp_path / "data"
@@ -212,6 +296,7 @@ class TestScanSessions:
                     "cwd": "/Users/test/Code/MyProject",
                     "cli_version": "0.128.0",
                     "model_provider": "openai",
+                    "timestamp": "2026-05-03T11:20:01Z",
                 },
             }),
             json.dumps({
@@ -247,7 +332,62 @@ class TestScanSessions:
         assert len(sessions) >= 1
         assert sessions[0]["id"].startswith("codex-session-")
         assert sessions[0]["extra"]["agent"] == "codex"
+        assert sessions[0]["prov_when"] == "2026-05-03T11:20:01.000Z"
         s.close()
+
+    def test_codex_sessions_filter_by_metadata_time_before_limit(self, tmp_path):
+        data_dir = tmp_path / "data"
+        codex_dir = tmp_path / "codex"
+        sessions_dir = codex_dir / "sessions"
+        sessions_dir.mkdir(parents=True)
+
+        def write_session(path, session_id, timestamp):
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": session_id,
+                                    "cwd": "/tmp/project",
+                                    "timestamp": timestamp,
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "Kindex memory keeps session source timestamps. Ambient Structure Discovery uses session traces.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                    ]
+                )
+            )
+
+        write_session(sessions_dir / "old.jsonl", "old-session-id", "2026-05-01T00:00:00Z")
+        write_session(sessions_dir / "new.jsonl", "new-session-id", "2026-06-20T00:00:00Z")
+        cfg = Config(data_dir=str(data_dir), codex_dir=str(codex_dir))
+        store = Store(cfg)
+
+        from kindex.ingest import scan_codex_sessions
+
+        count = scan_codex_sessions(cfg, store, limit=1, since="2026-06-01")
+        sessions = store.all_nodes(node_type="session")
+
+        assert count == 1
+        assert sessions[0]["id"] == "codex-session-new-session-"
+        assert sessions[0]["prov_when"] == "2026-06-20T00:00:00.000Z"
+        store.close()
 
     def test_codex_sessions_idempotent(self, tmp_path):
         data_dir = tmp_path / "data"

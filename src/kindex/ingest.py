@@ -161,6 +161,7 @@ def scan_sessions(
     config: Config,
     store: Store,
     limit: int = 10,
+    since: str | None = None,
     verbose: bool = False,
 ) -> int:
     """Scan Claude Code project directories for session data.
@@ -189,13 +190,11 @@ def scan_sessions(
         pass
 
     # Find recent JSONL conversation files
-    jsonl_files = sorted(
-        projects_dir.rglob("*.jsonl"),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )[:limit]
+    from .session_sources import recent_session_files
 
-    for jsonl_path in jsonl_files:
+    jsonl_files = recent_session_files(projects_dir, since=since, limit=limit)
+
+    for jsonl_path, event_time in jsonl_files:
         session_id = jsonl_path.stem[:12]
         session_slug = f"session-{session_id}"
 
@@ -235,8 +234,9 @@ def scan_sessions(
             content=summary,
             node_type="session",
             prov_source=str(jsonl_path),
+            prov_when=event_time.isoformat(),
             prov_activity="session-scan",
-            extra={"project": project_context},
+            extra={"project": project_context, "timestamp": event_time.isoformat()},
         )
         count += 1
 
@@ -264,6 +264,7 @@ def scan_codex_sessions(
     config: Config,
     store: Store,
     limit: int = 10,
+    since: str | None = None,
     verbose: bool = False,
 ) -> int:
     """Scan Codex session JSONL files from ~/.codex/sessions/.
@@ -278,13 +279,16 @@ def scan_codex_sessions(
     count = 0
     from .extract import keyword_extract
 
-    jsonl_files = sorted(
-        sessions_dir.rglob("*.jsonl"),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )[:limit]
+    from .session_sources import codex_event_time, recent_session_files
 
-    for jsonl_path in jsonl_files:
+    jsonl_files = recent_session_files(
+        sessions_dir,
+        event_time=codex_event_time,
+        since=since,
+        limit=limit,
+    )
+
+    for jsonl_path, event_time in jsonl_files:
         meta, text = _extract_codex_session(jsonl_path, max_chars=8000)
         if not text or len(text) < 50:
             continue
@@ -311,7 +315,7 @@ def scan_codex_sessions(
             "cwd": cwd,
             "model_provider": meta.get("model_provider", ""),
             "cli_version": meta.get("cli_version", ""),
-            "timestamp": meta.get("timestamp", ""),
+            "timestamp": event_time.isoformat(),
         }
 
         store.add_node(
@@ -321,6 +325,7 @@ def scan_codex_sessions(
             node_type="session",
             domains=["codex"],
             prov_source=str(jsonl_path),
+            prov_when=event_time.isoformat(),
             prov_activity="codex-session-scan",
             extra=extra,
         )
@@ -366,6 +371,8 @@ def _extract_codex_session(jsonl_path: Path, max_chars: int = 8000) -> tuple[dic
                     payload = entry.get("payload") or {}
                     if isinstance(payload, dict):
                         meta.update(payload)
+                    if entry.get("timestamp") and not meta.get("timestamp"):
+                        meta["timestamp"] = entry["timestamp"]
                     continue
 
                 if entry.get("type") != "response_item":

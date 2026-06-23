@@ -29,7 +29,9 @@ class SessionsAdapter:
         from ..ingest import scan_sessions
 
         cfg = kwargs.get("_config") or load_config()
-        created = scan_sessions(cfg, store, limit=limit, verbose=verbose)
+        created = scan_sessions(
+            cfg, store, limit=limit, since=since, verbose=verbose
+        )
         return IngestResult(created=created)
 
 
