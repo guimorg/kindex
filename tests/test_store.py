@@ -1,5 +1,9 @@
 """Tests for SQLite store."""
 
+import os
+import time
+from datetime import datetime, timezone
+
 import pytest
 
 from kindex.config import Config
@@ -51,6 +55,158 @@ class TestNodeOperations:
         store.add_node("C", node_type="concept")
         assert len(store.all_nodes()) == 3
         assert len(store.all_nodes(node_type="concept")) == 2
+
+    def test_all_nodes_filters_by_source_event_time(self, store):
+        store.add_node("Before", node_id="before", prov_when="2026-06-09T23:59:59Z")
+        store.add_node("Start", node_id="start", prov_when="2026-06-10T00:00:00Z")
+        store.add_node("End", node_id="end", prov_when="2026-06-24T00:00:00Z")
+
+        nodes = store.all_nodes(
+            since="2026-06-10T00:00:00Z",
+            until="2026-06-24T00:00:00Z",
+            order="event_time_asc",
+        )
+
+        assert [node["id"] for node in nodes] == ["start"]
+
+    def test_all_nodes_falls_back_to_created_at(self, store):
+        store.add_node("Legacy", node_id="legacy")
+        store.conn.execute(
+            "UPDATE nodes SET prov_when = '', created_at = ? WHERE id = ?",
+            ("2026-06-12T10:00:00", "legacy"),
+        )
+        store.conn.commit()
+
+        nodes = store.all_nodes(since="2026-06-12", until="2026-06-13")
+
+        assert [node["id"] for node in nodes] == ["legacy"]
+
+    def test_all_nodes_paginates_with_stable_event_order(self, store):
+        for index in range(4):
+            store.add_node(
+                f"Node {index}",
+                node_id=f"node-{index}",
+                prov_when=f"2026-06-1{index}T00:00:00Z",
+            )
+
+        first = store.all_nodes(limit=2, offset=0, order="event_time_asc")
+        second = store.all_nodes(limit=2, offset=2, order="event_time_asc")
+
+        assert [node["id"] for node in first] == ["node-0", "node-1"]
+        assert [node["id"] for node in second] == ["node-2", "node-3"]
+        assert store.count_nodes(since="2026-06-10", until="2026-06-14") == 4
+
+    def test_page_nodes_reads_total_and_nodes_from_one_snapshot(self, store, monkeypatch):
+        writer = Store(store.config)
+        writer.conn
+        original_count = store.count_nodes
+
+        def count_then_write(*args, **kwargs):
+            total = original_count(*args, **kwargs)
+            writer.add_node("Concurrent", node_id="concurrent")
+            return total
+
+        monkeypatch.setattr(store, "count_nodes", count_then_write)
+        try:
+            nodes, total = store.page_nodes()
+        finally:
+            writer.close()
+
+        assert nodes == []
+        assert total == 0
+        assert original_count() == 1
+
+    def test_page_nodes_does_not_commit_caller_transaction(self, store):
+        store.conn.execute("BEGIN")
+
+        nodes, total = store.page_nodes()
+
+        assert nodes == []
+        assert total == 0
+        assert store.conn.in_transaction
+        store.conn.rollback()
+
+    def test_all_nodes_preserves_fractional_second_precision(self, store):
+        store.add_node("Later", node_id="later", prov_when="2026-06-10T00:00:00.900Z")
+        store.add_node("Earlier", node_id="earlier", prov_when="2026-06-10T00:00:00.100Z")
+
+        nodes = store.all_nodes(
+            since="2026-06-10T00:00:00.050Z",
+            until="2026-06-10T00:00:00.500Z",
+            order="event_time_asc",
+        )
+
+        assert [node["id"] for node in nodes] == ["earlier"]
+
+    def test_add_node_normalizes_event_time_to_milliseconds(self, store):
+        store.add_node(
+            "Rounded",
+            node_id="rounded",
+            prov_when="2026-06-10T03:00:00.123500+03:00",
+        )
+
+        assert store.get_node("rounded")["prov_when"] == "2026-06-10T00:00:00.124Z"
+
+    def test_add_node_default_event_time_is_utc_under_non_utc_timezone(self, store):
+        original_timezone = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/Sao_Paulo"
+            time.tzset()
+            before = datetime.now(timezone.utc)
+            store.add_node("UTC default", node_id="utc-default")
+            after = datetime.now(timezone.utc)
+        finally:
+            if original_timezone is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_timezone
+            time.tzset()
+
+        event_time = datetime.fromisoformat(store.get_node("utc-default")["prov_when"])
+        assert before.timestamp() - 0.001 <= event_time.timestamp()
+        assert event_time.timestamp() <= after.timestamp() + 0.001
+
+    def test_store_normalizes_sub_millisecond_query_boundaries(self, store):
+        store.add_node(
+            "Rounded",
+            node_id="rounded",
+            prov_when="2026-06-10T00:00:00.000500Z",
+        )
+
+        nodes = store.all_nodes(
+            since="2026-06-10T00:00:00.000500Z",
+            until="2026-06-10T00:00:00.001500Z",
+        )
+
+        assert [node["id"] for node in nodes] == ["rounded"]
+
+    def test_all_nodes_normalizes_timezone_offsets(self, store):
+        store.add_node("Same instant", node_id="same", prov_when="2026-06-10T03:00:00+03:00")
+        store.add_node("Later", node_id="later", prov_when="2026-06-10T00:00:00.001Z")
+
+        nodes = store.all_nodes(
+            since="2026-06-10T00:00:00Z",
+            until="2026-06-10T00:00:00.001Z",
+            order="event_time_asc",
+        )
+
+        assert [node["id"] for node in nodes] == ["same"]
+
+    def test_temporal_filter_uses_event_time_expression_index(self, store):
+        where, params = store._node_filters(since="2026-06-10T00:00:00Z")
+        plan = store.conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM nodes WHERE {where}", params
+        ).fetchall()
+
+        assert any("idx_nodes_event_time" in row["detail"] for row in plan)
+
+    def test_all_nodes_rejects_invalid_order_and_offset(self, store):
+        with pytest.raises(ValueError, match="offset"):
+            store.all_nodes(offset=-1)
+        with pytest.raises(ValueError, match="order"):
+            store.all_nodes(order="newest")
+        with pytest.raises(ValueError, match="since must be earlier"):
+            store.all_nodes(since="2026-06-11", until="2026-06-10")
 
     def test_recent_nodes(self, store):
         store.add_node("Old")

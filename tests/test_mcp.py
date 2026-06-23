@@ -129,6 +129,93 @@ class TestMCPListNodes:
         result = list_nodes(node_type="nonexistent-type")
         assert "No nodes" in result
 
+    def test_list_uses_canonical_store_page(self, patch_store, monkeypatch):
+        store, _ = patch_store
+        calls = []
+
+        def page_nodes(**kwargs):
+            calls.append(kwargs)
+            return [], 1
+
+        monkeypatch.setattr(store, "page_nodes", page_nodes)
+        monkeypatch.setattr(
+            store,
+            "count_nodes",
+            lambda **kwargs: pytest.fail("MCP must not count outside Store.page_nodes"),
+        )
+        monkeypatch.setattr(
+            store,
+            "all_nodes",
+            lambda **kwargs: pytest.fail("MCP must not list outside Store.page_nodes"),
+        )
+
+        from kindex.mcp_server import list_nodes
+
+        result = list_nodes(node_type="concept", limit=1, offset=2)
+
+        assert "0 node(s) returned of 1 matching" in result
+        assert calls == [
+            {
+                "node_type": "concept",
+                "status": None,
+                "audience": None,
+                "tags": None,
+                "since": None,
+                "until": None,
+                "limit": 1,
+                "offset": 2,
+                "order": "weight",
+            }
+        ]
+
+    def test_list_temporal_page_includes_total_next_offset_and_time(self, patch_store):
+        store, _ = patch_store
+        store.add_node("Day one", node_id="day-one", prov_when="2030-01-01T12:00:00Z")
+        store.add_node("Day two", node_id="day-two", prov_when="2030-01-02T12:00:00Z")
+
+        from kindex.mcp_server import list_nodes
+
+        result = list_nodes(
+            since="2030-01-01",
+            until="2030-01-03",
+            limit=1,
+            offset=0,
+            order="event_time_asc",
+        )
+
+        assert "1 node(s) returned of 2 matching" in result
+        assert "Next offset: 1" in result
+        assert "Day one" in result
+        assert "when=2030-01-01T12:00:00.000Z" in result
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"since": "not-a-date"}, "since must be an ISO"),
+            ({"until": "not-a-date"}, "until must be an ISO"),
+            (
+                {"since": "2030-01-03", "until": "2030-01-02"},
+                "since must be earlier than or equal to until",
+            ),
+            ({"offset": -1}, "offset must be non-negative"),
+            ({"limit": 0}, "limit must be positive"),
+            ({"order": "newest"}, "order must be"),
+        ],
+    )
+    def test_list_rejects_invalid_temporal_parameters(self, patch_store, kwargs, message):
+        from kindex.mcp_server import list_nodes
+
+        assert message in list_nodes(**kwargs)
+
+    def test_list_allows_offset_beyond_total(self, patch_store):
+        from kindex.mcp_server import list_nodes
+
+        result = list_nodes(offset=10_000)
+
+        assert "0 node(s) returned" in result
+        assert "offset=10000" in result
+        assert "Next offset" not in result
+
 
 class TestMCPStatus:
     def test_status_returns_stats(self, patch_store):

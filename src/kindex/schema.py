@@ -4,6 +4,11 @@ from __future__ import annotations
 
 SCHEMA_VERSION = 5
 
+# SQLite's julianday() normalizes ISO-8601 offsets at millisecond resolution.
+# Keep this expression identical in schema indexes and store queries so the
+# query planner can use the index for temporal filters and ordering.
+NODE_EVENT_TIME_SQL = "julianday(COALESCE(NULLIF(prov_when, ''), created_at))"
+
 # Audience scopes for tenancy model
 AUDIENCES = ("private", "team", "org", "public")
 
@@ -164,3 +169,8 @@ CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
 CREATE INDEX IF NOT EXISTS idx_reminders_next_due ON reminders(next_due);
 CREATE INDEX IF NOT EXISTS idx_reminders_priority ON reminders(priority);
 """
+
+CREATE_TABLES += (
+    "\nCREATE INDEX IF NOT EXISTS idx_nodes_event_time "
+    f"ON nodes({NODE_EVENT_TIME_SQL});\n"
+)
