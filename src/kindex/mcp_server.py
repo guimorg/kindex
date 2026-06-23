@@ -109,12 +109,14 @@ def _json(obj: Any, **kw) -> str:
     return json.dumps(obj, default=default, **kw)
 
 
-def _node_summary(node: dict) -> str:
+def _node_summary(node: dict, *, include_event_time: bool = False) -> str:
     """One-line summary of a node."""
     ntype = node.get("type", "concept")
     title = node.get("title", node.get("id", "?"))
     weight = node.get("weight", 0)
-    return f"[{ntype}] {title} (w={weight:.2f}, id={node['id']})"
+    event_time = node.get("prov_when") or node.get("created_at")
+    when = f", when={event_time}" if include_event_time and event_time else ""
+    return f"[{ntype}] {title} (w={weight:.2f}, id={node['id']}{when})"
 
 
 def _node_detail(store, node: dict) -> str:
@@ -364,6 +366,10 @@ def list_nodes(
     audience: str = "",
     tags: str = "",
     limit: int = 100,
+    since: str = "",
+    until: str = "",
+    offset: int = 0,
+    order: str = "weight",
 ) -> str:
     """List nodes in the knowledge graph with optional filters.
 
@@ -373,22 +379,53 @@ def list_nodes(
         audience: Filter by audience (private, team, org, public).
         tags: Filter by tags (comma-separated, AND logic — node must have all).
         limit: Maximum number of nodes to return.
+        since: Inclusive ISO source-event timestamp. Falls back to node creation time.
+        until: Exclusive ISO source-event timestamp. Falls back to node creation time.
+        offset: Number of matching nodes to skip. Default: 0.
+        order: Sort order: weight, event_time_desc, or event_time_asc.
     """
+    if limit <= 0:
+        return "Error: limit must be positive."
+    if offset < 0:
+        return "Error: offset must be non-negative."
+    if order not in {"weight", "event_time_desc", "event_time_asc"}:
+        return "Error: order must be weight, event_time_desc, or event_time_asc."
+    try:
+        from .temporal import normalize_time_range
+
+        since, until = normalize_time_range(since, until)
+    except ValueError as exc:
+        return f"Error: {exc}."
+
     store, _ = _get_store()
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    nodes = store.all_nodes(
+    filters = dict(
         node_type=node_type or None,
         status=status or None,
         audience=audience or None,
         tags=tag_list,
-        limit=limit,
+        since=since or None,
+        until=until or None,
     )
-    if not nodes:
+    nodes, total = store.page_nodes(
+        **filters,
+        limit=limit,
+        offset=offset,
+        order=order,
+    )
+    if not nodes and total == 0:
         return "No nodes found matching filters."
 
-    lines = [f"{len(nodes)} node(s):\n"]
+    lines = [
+        f"{len(nodes)} node(s) returned of {total} matching "
+        f"(offset={offset}, limit={limit}).\n"
+    ]
+    next_offset = offset + len(nodes)
+    if next_offset < total:
+        lines.append(f"Next offset: {next_offset}")
+    include_event_time = bool(since or until or order.startswith("event_time"))
     for n in nodes:
-        lines.append(_node_summary(n))
+        lines.append(_node_summary(n, include_event_time=include_event_time))
     return "\n".join(lines)
 
 

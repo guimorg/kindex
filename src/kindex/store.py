@@ -6,7 +6,7 @@ import datetime as _dt
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,8 @@ def _jdumps(obj):
     return json.dumps(obj, default=_json_default)
 
 from .config import Config
-from .schema import CREATE_TABLES, SCHEMA_VERSION
+from .schema import CREATE_TABLES, NODE_EVENT_TIME_SQL, SCHEMA_VERSION
+from .temporal import normalize_iso_datetime, normalize_time_range
 
 
 def _now() -> str:
@@ -353,7 +354,8 @@ class Store:
             domains = list(set((domains or []) + tags))
         nid = node_id or _uuid()
         now = _now()
-        when = prov_when or now
+        event_time = prov_when or datetime.now(timezone.utc).isoformat()
+        when = normalize_iso_datetime(event_time, "prov_when")
         self.conn.execute(
             """INSERT OR REPLACE INTO nodes
                (id, type, title, content, aka, intent,
@@ -474,31 +476,143 @@ class Store:
         self.conn.commit()
         self._log("delete_node", node_id, title)
 
-    def all_nodes(self, node_type: str | None = None,
-                  status: str | None = None,
-                  audience: str | None = None,
-                  tags: list[str] | None = None,
-                  limit: int = 500) -> list[dict]:
-        """List nodes with optional type/status/audience/tags filters."""
-        q = "SELECT * FROM nodes WHERE 1=1"
+    @staticmethod
+    def _node_filters(
+        node_type: str | None = None,
+        status: str | None = None,
+        audience: str | None = None,
+        tags: list[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> tuple[str, list]:
+        """Build the shared predicate for node listing and counting."""
+        clauses = ["1=1"]
         params: list = []
         if node_type:
-            q += " AND type = ?"
+            clauses.append("type = ?")
             params.append(node_type)
         if status:
-            q += " AND status = ?"
+            clauses.append("status = ?")
             params.append(status)
         if audience:
-            q += " AND audience = ?"
+            clauses.append("audience = ?")
             params.append(audience)
         if tags:
             for tag in tags:
-                q += " AND domains LIKE ?"
+                clauses.append("domains LIKE ?")
                 params.append(f'%"{tag}"%')
-        q += " ORDER BY weight DESC, updated_at DESC LIMIT ?"
-        params.append(limit)
+        normalized_since, normalized_until = normalize_time_range(since or "", until or "")
+        if normalized_since:
+            clauses.append(f"{NODE_EVENT_TIME_SQL} >= julianday(?)")
+            params.append(normalized_since)
+        if normalized_until:
+            clauses.append(f"{NODE_EVENT_TIME_SQL} < julianday(?)")
+            params.append(normalized_until)
+        return " AND ".join(clauses), params
+
+    def all_nodes(
+        self,
+        node_type: str | None = None,
+        status: str | None = None,
+        audience: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 500,
+        since: str | None = None,
+        until: str | None = None,
+        offset: int = 0,
+        order: str = "weight",
+    ) -> list[dict]:
+        """List nodes with optional metadata, temporal, and pagination filters."""
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        order_by = {
+            "weight": "weight DESC, updated_at DESC, id ASC",
+            "event_time_desc": f"{NODE_EVENT_TIME_SQL} DESC, id ASC",
+            "event_time_asc": f"{NODE_EVENT_TIME_SQL} ASC, id ASC",
+        }
+        if order not in order_by:
+            raise ValueError(f"unsupported node order: {order}")
+
+        where, params = self._node_filters(
+            node_type=node_type,
+            status=status,
+            audience=audience,
+            tags=tags,
+            since=since,
+            until=until,
+        )
+        q = f"SELECT * FROM nodes WHERE {where} ORDER BY {order_by[order]} LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
         rows = self.conn.execute(q, params).fetchall()
         return [self._row_to_dict(r) for r in rows]
+
+    def count_nodes(
+        self,
+        node_type: str | None = None,
+        status: str | None = None,
+        audience: str | None = None,
+        tags: list[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> int:
+        """Count nodes matching the same filters accepted by ``all_nodes``."""
+        where, params = self._node_filters(
+            node_type=node_type,
+            status=status,
+            audience=audience,
+            tags=tags,
+            since=since,
+            until=until,
+        )
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM nodes WHERE {where}", params
+        ).fetchone()
+        return int(row["count"])
+
+    def page_nodes(
+        self,
+        node_type: str | None = None,
+        status: str | None = None,
+        audience: str | None = None,
+        tags: list[str] | None = None,
+        limit: int = 500,
+        since: str | None = None,
+        until: str | None = None,
+        offset: int = 0,
+        order: str = "weight",
+    ) -> tuple[list[dict], int]:
+        """Return one page and its total from the same SQLite snapshot."""
+        conn = self.conn
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN")
+        try:
+            total = self.count_nodes(
+                node_type=node_type,
+                status=status,
+                audience=audience,
+                tags=tags,
+                since=since,
+                until=until,
+            )
+            nodes = self.all_nodes(
+                node_type=node_type,
+                status=status,
+                audience=audience,
+                tags=tags,
+                limit=limit,
+                since=since,
+                until=until,
+                offset=offset,
+                order=order,
+            )
+            if owns_transaction:
+                conn.commit()
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+        return nodes, total
 
     def recent_nodes(self, n: int = 20) -> list[dict]:
         rows = self.conn.execute(

@@ -112,7 +112,9 @@ class Adapter(Protocol):
         Args:
             store: Kindex Store instance for creating nodes/edges.
             limit: Maximum items to ingest.
-            since: ISO date string — only ingest items after this date.
+            since: Inclusive ISO date/time lower bound applied by the source
+                before its limit. Adapters should preserve source event time
+                as ``prov_when`` when available.
             verbose: Print progress to stdout.
             **kwargs: Adapter-specific options (repo, team, path, etc.).
 
