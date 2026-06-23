@@ -31,6 +31,24 @@ Use `search` when starting a task, entering an unfamiliar project, revisiting a
 topic, or before adding new knowledge. This prevents duplicates and reveals
 constraints or previous decisions.
 
+### Browse Nodes by Event Time
+
+`list_nodes` accepts temporal and pagination parameters for bounded history
+queries:
+
+- `since` is an inclusive ISO 8601 lower bound.
+- `until` is an exclusive ISO 8601 upper bound.
+- `offset` defaults to `0` and applies after filtering and ordering.
+- `order` may be `weight` (the existing default), `event_time_desc`, or
+  `event_time_asc`.
+
+Event time is the node's source timestamp (`prov_when`). Legacy nodes without a
+source timestamp fall back to `created_at`. Temporal responses include the
+resolved event timestamp, matching total, current offset, and next offset when
+another page exists. Calls that omit these parameters retain the existing
+weight-ordered behavior. Event times and query bounds are normalized to UTC at
+millisecond resolution, matching SQLite's indexed temporal comparison.
+
 ### Capture Knowledge
 
 Use `add` for durable knowledge, not routine transcript logging.
@@ -141,6 +159,11 @@ To ingest saved Codex sessions:
 ```bash
 kin ingest codex-sessions
 ```
+
+The Claude and Codex session adapters use source session timestamps, filter
+`--since` before applying `--limit`, and fall back to the session file's
+modification time when source metadata has no timestamp. The commits adapter
+passes `--since` to Git so its limit applies to the requested time window.
 
 ## Human Setup Checklist
 
