@@ -73,6 +73,7 @@ class EmbeddingConfig(BaseModel):
     max_group_chunks: int = 20   # chunks sent together for contextual embedding
     reindex_max_jobs: int = 200  # cron drain cap for queued embedding work
     reindex_max_queue: int = 100000
+    drain_time_budget: int = 120  # wall-clock seconds cap per cron embedding drain
 
 
 class LLMConfig(BaseModel):
@@ -538,6 +539,16 @@ def load_config(
             data = _load_kin_config_with_inheritance(p)
             if "profile" in data:
                 kin_profile = data.pop("profile")
+            # A relative data_dir in a project config means "inside this
+            # project" — anchor it to the config's root now. Config.data_path
+            # resolves against process cwd, which is wrong for any invocation
+            # that isn't sitting at the project root: a scheduler/hook run
+            # with --project-path would silently open <cwd>/.kindex-data, and
+            # a run from a subdirectory would split the graph.
+            raw_dd = data.get("data_dir")
+            if raw_dd and not Path(str(raw_dd)).expanduser().is_absolute():
+                config_root = p.parent.parent if p.parent.name == ".kin" else p.parent
+                data["data_dir"] = str(config_root / Path(str(raw_dd)).expanduser())
             merged = _deep_merge(merged, data)
             break  # use first local found
 

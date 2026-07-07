@@ -90,8 +90,10 @@ def execute_action(
     if not has_action(reminder):
         return {"status": "skipped", "reason": "no action defined"}
 
-    if fields["action_status"] in ("completed", "running"):
-        return {"status": "skipped", "reason": f"already {fields['action_status']}"}
+    if fields["action_status"] == "completed":
+        return {"status": "skipped", "reason": "already completed"}
+    if fields["action_status"] == "running" and not _running_is_stale(reminder, timeout):
+        return {"status": "skipped", "reason": "already running"}
 
     mode = resolve_mode(fields)
     rid = reminder["id"]
@@ -121,6 +123,26 @@ def execute_action(
 
 
 # ── Internal helpers ───────────────────────────────────────────────
+
+
+def _running_is_stale(reminder: dict, timeout: int) -> bool:
+    """True when a ``running`` action_status is a leftover from a dead run.
+
+    A cron process killed mid-action (launchd unload, crash, hang) leaves the
+    reminder stuck at ``running`` and, since running actions are skipped, no
+    occurrence would ever execute again. Any well-behaved run finishes within
+    its subprocess ``timeout``, so a running marker older than twice that (plus
+    slack) cannot belong to a live run and is safe to reclaim. A missing or
+    unparseable ``action_executed_at`` is also reclaimed — there is no evidence
+    of a live run to protect.
+    """
+    stamp = (reminder.get("extra") or {}).get("action_executed_at", "")
+    try:
+        executed = datetime.datetime.fromisoformat(stamp)
+    except (ValueError, TypeError):
+        return True
+    age = (datetime.datetime.now() - executed).total_seconds()
+    return age > (2 * timeout + 60)
 
 
 def _update_action_status(

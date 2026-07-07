@@ -83,7 +83,7 @@ Reminders are stored in Kindex and fired by a checker. Creating a reminder does
 not itself wake a running agent.
 
 ```bash
-# Install periodic checks once
+# Install periodic checks once (maintenance job + dedicated reminder checker)
 kin setup-cron
 
 # Create a normal reminder
@@ -91,7 +91,15 @@ kin remind create "Check deploy" --at "in 30 minutes" --priority high
 
 # Run due reminders manually
 kin remind check
+
+# Sweep every profile and registered project graph
+kin remind check --all-profiles
 ```
+
+The dedicated reminder checker runs `kin remind check --all-profiles` on its
+own schedule, so due reminders fire even when a maintenance run is slow or
+stalled. Within `kin cron` itself, reminders are checked before any ingest,
+LLM, or embedding work.
 
 Wake reminders can start headless Codex or OpenCode follow-up turns when the
 checker runs:

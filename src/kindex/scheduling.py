@@ -131,7 +131,12 @@ def _apply_crontab(interval: int, config: "Config") -> dict:
         return {"action": "skipped", "reason": "no crontab"}
 
     lines = result.stdout.splitlines()
-    new_lines = [l for l in lines if "kin cron" not in l and "kindex" not in l]
+    # Replace only the maintenance line. The dedicated "remind check" line must
+    # survive repacks — it is the guarantee that reminders fire even when the
+    # maintenance job is slow, disabled, or stalled.
+    new_lines = [l for l in lines
+                 if "remind check" in l
+                 or ("kin cron" not in l and "kindex" not in l)]
 
     if interval > 0:
         from .setup import _find_kin_path

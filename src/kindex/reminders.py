@@ -485,14 +485,92 @@ def advance_recurring(store: Store, reminder_id: str) -> str | None:
             store.complete_reminder(reminder_id)
             return None
 
-    store.update_reminder(
-        reminder_id,
-        next_due=next_due,
-        last_fired=_now(),
-        status="active",
-        snooze_until=None,
-    )
+    updates: dict = {
+        "next_due": next_due,
+        "last_fired": _now(),
+        "status": "active",
+        "snooze_until": None,
+    }
+    # Reset the action for the next occurrence. execute_action skips any
+    # reminder whose action_status is completed/running, so without this reset
+    # a recurring action would execute exactly once and every later occurrence
+    # would silently no-op (last action_result is kept as the last-run record).
+    # A live "running" marker is left alone — resetting it would let the next
+    # occurrence overlap an execution still in flight; if the runner died, the
+    # stale-reclaim in execute_action recovers it on the next attempt.
+    extra = dict(r.get("extra") or {})
+    if extra.get("action_status") and extra["action_status"] != "running":
+        extra["action_status"] = "pending"
+        updates["extra"] = extra
+
+    store.update_reminder(reminder_id, **updates)
     return next_due
+
+
+_CHECK_LOCK_KEY = "reminder_check_lock"
+_CHECK_LOCK_TTL = 120  # seconds — well past a normal sweep, short enough that
+                       # a crashed holder only delays the next check briefly
+
+
+def _acquire_check_lock(store: Store, ttl: int = _CHECK_LOCK_TTL) -> str | None:
+    """Atomically claim this graph's reminder-sweep lock, or return None.
+
+    Multiple schedulers legitimately run ``check_and_fire`` on the same graph
+    (kin cron's step-0/step-10 checks, the dedicated remind-check job, manual
+    ``kin remind check``). Without mutual exclusion two concurrent sweeps read
+    the same due list and each dispatches the notification and executes the
+    action before either writes state — a double-fire. The lock value is
+    ``token|expires_iso`` in the meta table; the conditional UPDATE is atomic
+    under SQLite's write lock, so exactly one contender wins. An expired value
+    (crashed holder) is claimable immediately.
+    """
+    import uuid
+
+    token = uuid.uuid4().hex
+    now = _now_dt()
+    expires = (now + datetime.timedelta(seconds=ttl)).isoformat(timespec="seconds")
+    now_iso = now.isoformat(timespec="seconds")
+    conn = store.conn
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '')",
+        (_CHECK_LOCK_KEY,),
+    )
+    cur = conn.execute(
+        """UPDATE meta SET value = ?
+           WHERE key = ?
+             AND (value = '' OR substr(value, instr(value, '|') + 1) < ?)""",
+        (f"{token}|{expires}", _CHECK_LOCK_KEY, now_iso),
+    )
+    conn.commit()
+    return token if cur.rowcount == 1 else None
+
+
+def _renew_check_lock(store: Store, token: str,
+                      ttl: int = _CHECK_LOCK_TTL) -> bool:
+    """Extend a held lock's expiry. Returns False if the lock was lost.
+
+    A sweep can legitimately outlive the base TTL — a single reminder action
+    has a 300s subprocess budget and a sweep may run several sequentially. The
+    holder heartbeats before each reminder so the lock never looks abandoned
+    while work is in flight; only a genuinely dead holder stops renewing.
+    """
+    expires = (_now_dt() + datetime.timedelta(seconds=ttl)).isoformat(
+        timespec="seconds"
+    )
+    cur = store.conn.execute(
+        "UPDATE meta SET value = ? WHERE key = ? AND value LIKE ?",
+        (f"{token}|{expires}", _CHECK_LOCK_KEY, f"{token}|%"),
+    )
+    store.conn.commit()
+    return cur.rowcount == 1
+
+
+def _release_check_lock(store: Store, token: str) -> None:
+    store.conn.execute(
+        "UPDATE meta SET value = '' WHERE key = ? AND value LIKE ?",
+        (_CHECK_LOCK_KEY, f"{token}|%"),
+    )
+    store.conn.commit()
 
 
 def check_and_fire(
@@ -504,11 +582,29 @@ def check_and_fire(
     If a reminder has an action and ``config.reminders.action_enabled`` is True,
     executes the action.  Successful actions auto-complete the reminder.
 
+    Only one sweep runs per graph at a time (see ``_acquire_check_lock``); a
+    contender that loses the lock returns [] — the holder is already firing
+    everything due.
+
     Returns list of fired reminders.
     """
     if not config.reminders.enabled:
         return []
 
+    token = _acquire_check_lock(store)
+    if token is None:
+        return []
+    try:
+        return _check_and_fire_locked(store, config, token)
+    finally:
+        _release_check_lock(store, token)
+
+
+def _check_and_fire_locked(
+    store: Store,
+    config: Config,
+    token: str,
+) -> list[dict]:
     from .notify import dispatch, is_user_idle
 
     # Skip all notifications if user is idle beyond threshold
@@ -521,6 +617,13 @@ def check_and_fire(
         if idle:
             # Don't fire; leave as-is so it fires when user returns
             continue
+
+        # Heartbeat before each reminder: dispatch + action can take minutes
+        # (300s subprocess budget apiece), far past the base TTL. Losing the
+        # lock means a contender legitimately reclaimed it — stop rather than
+        # risk double-firing what it is now processing.
+        if not _renew_check_lock(store, token):
+            break
 
         # Determine channels for this reminder
         channels = r.get("channels") or []
@@ -576,6 +679,12 @@ def auto_snooze_stale(store: Store, config: Config) -> int:
     count = 0
     for row in rows:
         r = store._reminder_to_dict(row)
+        # Re-check right before writing: the user (or another checker) may
+        # have completed/cancelled it since the SELECT — a blind snooze would
+        # resurrect it.
+        current = store.get_reminder(r["id"])
+        if not current or current["status"] != "fired":
+            continue
         snooze_until = (now + datetime.timedelta(seconds=snooze_duration)).isoformat(
             timespec="seconds"
         )

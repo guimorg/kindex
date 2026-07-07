@@ -20,6 +20,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,6 +78,7 @@ def _embedding_options(config: Config | None) -> dict:
         "max_group_chunks": max(1, int(getattr(ec, "max_group_chunks", 20) or 20)),
         "reindex_max_jobs": max(1, int(getattr(ec, "reindex_max_jobs", 200) or 200)),
         "reindex_max_queue": max(1, int(getattr(ec, "reindex_max_queue", 100000) or 100000)),
+        "drain_time_budget": max(1, int(getattr(ec, "drain_time_budget", 120) or 120)),
     }
 
 
@@ -632,17 +634,25 @@ def _embedding_queue_len(store: Store) -> int:
 
 
 def drain_embedding_queue(store: Store, config: Config | None = None, *,
-                          max_jobs: int | None = None) -> dict:
+                          max_jobs: int | None = None,
+                          time_budget: float | None = None) -> dict:
     """Embed queued nodes. This is where the (possibly networked) embedding cost
     lives — runs in cron, off the agent's path. Idempotent per node.
 
     Each node is re-fetched fresh so the embedding reflects its current text.
-    Bounded to ``max_jobs`` attempts per drain; unattempted nodes and transient
-    failures are carried to the next cron (failures re-queued at the tail so a
-    persistently failing node can't starve newer ones).
+    Bounded to ``max_jobs`` attempts AND ``time_budget`` wall-clock seconds per
+    drain; unattempted nodes and transient failures are carried to the next cron
+    (failures re-queued at the tail so a persistently failing node can't starve
+    newer ones). The time budget keeps a slow/stalling provider from consuming
+    the whole cron interval — each queued node can cost multiple HTTP calls at
+    up to 30s apiece, so a large backlog against a degraded provider would
+    otherwise run for hours.
     """
+    opts = _embedding_options(config or store.config)
     if max_jobs is None:
-        max_jobs = _embedding_options(config or store.config)["reindex_max_jobs"]
+        max_jobs = opts["reindex_max_jobs"]
+    if time_budget is None:
+        time_budget = opts["drain_time_budget"]
     try:
         raw = store.get_meta(EMBED_QUEUE_META)
         queue = json.loads(raw) if raw else []
@@ -662,8 +672,9 @@ def drain_embedding_queue(store: Store, config: Config | None = None, *,
     remaining: list[str] = []
     embedded = 0
     attempts = 0
+    deadline = time.monotonic() + float(time_budget)
     for i, node_id in enumerate(deduped):
-        if attempts >= max_jobs:
+        if attempts >= max_jobs or time.monotonic() >= deadline:
             remaining.extend(deduped[i:])  # carry the rest to the next cron
             break
         node = store.get_node(node_id)

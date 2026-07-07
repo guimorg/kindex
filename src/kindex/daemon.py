@@ -24,6 +24,8 @@ def cron_run(config: "Config", store: "Store", verbose: bool = False) -> dict:
     """One-shot run of all maintenance tasks. Designed for crontab.
 
     Steps:
+    0. Check reminders (FIRST — cheap and local; must never wait behind
+       networked ingest/LLM/embedding work that can stall for minutes)
     1. Ingest new projects (scan for CLAUDE.md files)
     2. Ingest new sessions (scan ~/.claude/projects/ for JSONL)
     3. Process inbox items
@@ -35,6 +37,13 @@ def cron_run(config: "Config", store: "Store", verbose: bool = False) -> dict:
     from .ingest import scan_kin_files, scan_projects, scan_sessions
 
     results: dict = {}
+
+    # 0. Check reminders before anything that can block. Every later step may
+    # hit the network (session ingest, reinforcement/sim/attention drains,
+    # embedding drain) — a due reminder must fire within seconds of cron start.
+    reminder_results = _check_reminders(config, store, verbose=verbose)
+    results["reminders_fired"] = reminder_results.get("fired", 0)
+    results["reminders_auto_snoozed"] = reminder_results.get("auto_snoozed", 0)
 
     # 1. Ingest new projects
     if verbose:
@@ -180,10 +189,10 @@ def cron_run(config: "Config", store: "Store", verbose: bool = False) -> dict:
         results.setdefault("conversations_expired", 0)
         results.setdefault("claims_released", 0)
 
-    # 10. Check reminders
-    reminder_results = _check_reminders(config, store, verbose=verbose)
-    results["reminders_fired"] = reminder_results.get("fired", 0)
-    results["reminders_auto_snoozed"] = reminder_results.get("auto_snoozed", 0)
+    # 10. Re-check reminders — anything that came due while maintenance ran.
+    late_reminders = _check_reminders(config, store, verbose=verbose)
+    results["reminders_fired"] += late_reminders.get("fired", 0)
+    results["reminders_auto_snoozed"] += late_reminders.get("auto_snoozed", 0)
 
     # 11. Lightweight dream — dedup + suggestion auto-apply, on its own cadence
     try:
@@ -218,11 +227,94 @@ def cron_run(config: "Config", store: "Store", verbose: bool = False) -> dict:
     return results
 
 
+def remind_check_all(base_config: "Config", verbose: bool = False) -> list[dict]:
+    """Reminder-only sweep across all configured profiles (plus the legacy
+    remainder graph) AND registered project-local ``.kin`` graphs. Cheap and
+    local — no ingest, no LLM, no embedding.
+
+    Runs first in ``cron_run_all`` and backs ``kin remind check --all-profiles``
+    so due reminders can never be starved by slow maintenance in another
+    profile's pass. Project graphs (a ``data_dir`` declared in a repo's
+    ``.kin/config``) belong to no profile — they are discovered by cron's
+    ``scan_kin_files`` into the ``project_graph_dirs`` meta registry and swept
+    here, since nothing else scheduled would ever fire their reminders.
+    Returns [{profile, fired, auto_snoozed}] per graph.
+    """
+    import json as _json
+
+    from .store import Store
+
+    swept_dirs: set[str] = set()
+    project_registry: dict[str, str] = {}
+
+    def _one(cfg: "Config", name: str | None) -> dict:
+        # Fault-isolated: a corrupt or locked graph must not abort the sweep
+        # for every other graph's reminders.
+        swept_dirs.add(str(cfg.data_path))
+        try:
+            store = Store(cfg)
+        except Exception as e:
+            return {"profile": name, "fired": 0, "auto_snoozed": 0,
+                    "error": str(e)}
+        try:
+            r = _check_reminders(cfg, store, verbose=verbose)
+            try:
+                raw = _json.loads(store.get_meta("project_graph_dirs") or "{}")
+                if isinstance(raw, dict):
+                    project_registry.update(raw)
+            except Exception:
+                pass
+        except Exception as e:
+            return {"profile": name, "fired": 0, "auto_snoozed": 0,
+                    "error": str(e)}
+        finally:
+            store.close()
+        return {"profile": name, "fired": r.get("fired", 0),
+                "auto_snoozed": r.get("auto_snoozed", 0)}
+
+    results: list[dict] = []
+    profiles = dict(getattr(base_config, "profiles", {}) or {})
+    if not profiles:
+        results.append(_one(base_config, getattr(base_config, "active_profile", None)))
+    else:
+        for name, entry in profiles.items():
+            cfg = base_config.model_copy(deep=True)
+            cfg.data_dir = str(Path(entry.data_dir).expanduser())
+            cfg.active_profile = name
+            cfg.profile_source = "cron"
+            results.append(_one(cfg, name))
+        if getattr(base_config, "default_profile", None) is None:
+            cfg = base_config.model_copy(deep=True)
+            legacy_dir = getattr(base_config, "_legacy_data_dir", None)
+            if legacy_dir:
+                cfg.data_dir = legacy_dir
+            cfg.active_profile = None
+            cfg.profile_source = "legacy"
+            results.append(_one(cfg, None))
+
+    # Project-local .kin graphs, deduped against the dirs already swept.
+    for project_root, data_dir in sorted(project_registry.items()):
+        if not Path(data_dir).exists():
+            continue  # project deleted since registration — ages out on scan
+        cfg = base_config.model_copy(deep=True)
+        cfg.data_dir = data_dir
+        cfg.active_profile = None
+        cfg.profile_source = "project"
+        if str(cfg.data_path) in swept_dirs:
+            continue
+        results.append(_one(cfg, project_root))
+    return results
+
+
 def cron_run_all(base_config: "Config", verbose: bool = False) -> list[dict]:
     """Run the cron maintenance cycle across all configured profiles.
 
-    No profiles configured -> a single legacy pass on base_config (byte-
-    identical to the pre-profile behavior). With profiles -> one pass per
+    Every run starts with a reminders-first sweep (``remind_check_all``) so
+    no graph's reminders wait behind another graph's maintenance and
+    project-local ``.kin`` graphs get serviced at all.
+
+    No profiles configured -> a single legacy pass on base_config (pre-profile
+    behavior, preceded by the sweep). With profiles -> one pass per
     profile, each on its own data_dir/Store. Claude session ingestion within
     a pass only takes sessions whose cwd falls under that profile's roots;
     the default profile additionally takes unmatched sessions. With profiles
@@ -236,12 +328,34 @@ def cron_run_all(base_config: "Config", verbose: bool = False) -> list[dict]:
     from .store import Store
 
     profiles = dict(getattr(base_config, "profiles", {}) or {})
+
+    # Reminders-first sweep across ALL graphs — profiles or legacy, plus
+    # registered project-local .kin graphs — before any maintenance pass.
+    # Within a pass reminders already run first, but graph B's reminders must
+    # not wait behind graph A's ingest/LLM/embedding work, and project graphs
+    # have no maintenance pass of their own at all.
+    sweep_entries = remind_check_all(base_config, verbose=verbose)
+    sweep = {s["profile"]: s for s in sweep_entries}
+    # Base-graph sweep entries are keyed by active_profile (a pinned
+    # `kin cron --profile X` clears profiles but keeps active_profile='X') —
+    # exclude them from the project-graph tally or one firing counts twice.
+    known_names = set(profiles) | {None, getattr(base_config, "active_profile", None)}
+    project_fired = sum(
+        s.get("fired", 0) for s in sweep_entries if s["profile"] not in known_names
+    )
+
     if not profiles:
         store = Store(base_config)
         try:
             results = cron_run(base_config, store, verbose=verbose)
         finally:
             store.close()
+        swept = sweep.get(getattr(base_config, "active_profile", None))
+        if swept:
+            results["reminders_fired"] += swept["fired"]
+            results["reminders_auto_snoozed"] += swept["auto_snoozed"]
+        if project_fired:
+            results["project_graph_reminders_fired"] = project_fired
         return [{
             "profile": getattr(base_config, "active_profile", None),
             "source": getattr(base_config, "profile_source", "legacy"),
@@ -263,6 +377,10 @@ def cron_run_all(base_config: "Config", verbose: bool = False) -> list[dict]:
             results = cron_run(cfg, store, verbose=verbose)
         finally:
             store.close()
+        swept = sweep.get(name)
+        if swept:
+            results["reminders_fired"] += swept["fired"]
+            results["reminders_auto_snoozed"] += swept["auto_snoozed"]
         passes.append({"profile": name, "source": "cron", "results": results})
 
     if default_name is None:
@@ -284,8 +402,14 @@ def cron_run_all(base_config: "Config", verbose: bool = False) -> list[dict]:
             results = cron_run(cfg, store, verbose=verbose)
         finally:
             store.close()
+        swept = sweep.get(None)
+        if swept:
+            results["reminders_fired"] += swept["fired"]
+            results["reminders_auto_snoozed"] += swept["auto_snoozed"]
         passes.append({"profile": None, "source": "legacy-remainder",
                        "results": results})
+    if project_fired and passes:
+        passes[0]["results"]["project_graph_reminders_fired"] = project_fired
     return passes
 
 

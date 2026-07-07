@@ -2,7 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![v0.27.1](https://img.shields.io/badge/version-0.27.1-purple.svg)](https://github.com/jmcentire/kindex/releases)
+[![v0.28.0](https://img.shields.io/badge/version-0.28.0-purple.svg)](https://github.com/jmcentire/kindex/releases)
 [![PyPI](https://img.shields.io/pypi/v/kindex.svg)](https://pypi.org/project/kindex/)
 [![MCP Market](https://img.shields.io/badge/MCP%20Market-kindex-blue.svg)](https://mcpmarket.com/server/kindex)
 [![Tests](https://img.shields.io/badge/tests-1559%20passing-brightgreen.svg)](#)
@@ -768,7 +768,7 @@ gain explicit contextual support.
 | `kin setup-antigravity-hooks` | Install lifecycle hooks into Google Antigravity |
 | `kin setup-opencode-mcp` | Install kindex MCP server into OpenCode |
 | `kin setup-cursor-mcp` | Install kindex MCP server into Cursor |
-| `kin setup-cron` | Install periodic maintenance (launchd/crontab) |
+| `kin setup-cron` | Install periodic maintenance + dedicated reminder-check job (launchd/crontab) |
 | `kin setup-claude-md` | Output/install recommended CLAUDE.md kindex directives |
 | `kin setup-agents-md` | Output/install recommended AGENTS.md kindex directives (Codex, OpenCode) |
 | `kin setup-gemini-md` | Output/install recommended GEMINI.md kindex directives |

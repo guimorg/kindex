@@ -525,6 +525,7 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
 
     count = 0
     all_pending: list[tuple[str, str]] = []  # (source_slug, target_name)
+    project_graphs: dict[str, str] = {}  # project_root -> resolved data_dir
     for project_dir in config.resolved_project_dirs:
         if not project_dir.exists():
             continue
@@ -551,6 +552,27 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
                 data = yaml.safe_load(config_file.read_text()) or {}
             except Exception:
                 continue
+
+            # Register project-local graphs (data_dir in .kin/config) so the
+            # reminder sweep (`remind_check_all`) can service them — these
+            # graphs belong to no profile, so without this registry nothing
+            # scheduled would ever fire their reminders. data_dir must come
+            # from the resolved inheritance chain, matching what load_config
+            # gives interactive sessions: a repo that merely `inherits:` a
+            # template declaring data_dir still gets its own live graph.
+            raw_dir = data.get("data_dir")
+            if not raw_dir:
+                try:
+                    from .config import _load_kin_config_with_inheritance
+                    raw_dir = _load_kin_config_with_inheritance(
+                        config_file).get("data_dir")
+                except Exception:
+                    raw_dir = None
+            if raw_dir:
+                resolved_dir = Path(str(raw_dir)).expanduser()
+                if not resolved_dir.is_absolute():
+                    resolved_dir = project_root / resolved_dir
+                project_graphs[str(project_root)] = str(resolved_dir.resolve())
 
             existing = store.get_node(slug)
             if existing:
@@ -628,6 +650,18 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
                       f"— target not in graph")
         if verbose and resolved:
             print(f"  Resolved {resolved}/{len(all_pending)} deferred connections")
+
+    # Persist the project-graph registry (merge over previous scans; drop
+    # entries whose data_dir no longer exists so deleted projects age out).
+    try:
+        previous = json.loads(store.get_meta("project_graph_dirs") or "{}")
+        if not isinstance(previous, dict):
+            previous = {}
+    except Exception:
+        previous = {}
+    merged_graphs = {**previous, **project_graphs}
+    merged_graphs = {root: d for root, d in merged_graphs.items() if Path(d).exists()}
+    store.set_meta("project_graph_dirs", json.dumps(merged_graphs))
 
     return count
 

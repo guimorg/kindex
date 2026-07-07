@@ -2485,8 +2485,13 @@ def cmd_embed(args):
             filters["max_queue"] = getattr(args, "max_queue", None)
             result = enqueue_reindex(store, **filters)
         elif action == "drain":
+            budget = getattr(args, "time_budget", None)
+            if budget == 0:
+                budget = float("inf")  # explicit 0 = drain the whole backlog
             result = drain_embedding_queue(
-                store, store.config, max_jobs=getattr(args, "max_jobs", None)
+                store, store.config,
+                max_jobs=getattr(args, "max_jobs", None),
+                time_budget=budget,
             )
         elif action == "reindex":
             if getattr(args, "enqueue", False):
@@ -3887,13 +3892,27 @@ def cmd_remind(args):
             print(f"Action {result['status']}: {result.get('output', '')[:200]}")
 
     elif action == "check":
-        from .reminders import auto_snooze_stale, check_and_fire
-        fired = check_and_fire(store, cfg)
-        snoozed = auto_snooze_stale(store, cfg)
-        if getattr(args, "json", False):
-            print(_dumps({"fired": len(fired), "auto_snoozed": snoozed}))
+        if getattr(args, "all_profiles", False):
+            # Sweep every configured profile graph (plus the legacy remainder)
+            # — the shape the installed reminder scheduler runs, so no graph's
+            # reminders depend on which profile happens to resolve here.
+            from .daemon import remind_check_all
+            sweeps = remind_check_all(cfg)
+            if getattr(args, "json", False):
+                print(_dumps(sweeps))
+            else:
+                for s in sweeps:
+                    label = s["profile"] or "default"
+                    print(f"Checked [{label}]: {s['fired']} fired, "
+                          f"{s['auto_snoozed']} auto-snoozed")
         else:
-            print(f"Checked: {len(fired)} fired, {snoozed} auto-snoozed")
+            from .reminders import auto_snooze_stale, check_and_fire
+            fired = check_and_fire(store, cfg)
+            snoozed = auto_snooze_stale(store, cfg)
+            if getattr(args, "json", False):
+                print(_dumps({"fired": len(fired), "auto_snoozed": snoozed}))
+            else:
+                print(f"Checked: {len(fired)} fired, {snoozed} auto-snoozed")
 
     store.close()
 
@@ -5013,29 +5032,37 @@ def cmd_setup_cron(args):
 
     if getattr(args, "uninstall", False):
         if method == "launchd":
-            from .setup import uninstall_launchd
+            from .setup import uninstall_launchd, uninstall_reminder_daemon
             actions = uninstall_launchd(dry_run=dry_run)
+            actions += uninstall_reminder_daemon(dry_run=dry_run)
         else:
-            # Remove crontab entry
+            # Remove crontab entries (maintenance + reminder check)
             import subprocess
             result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
             if result.returncode == 0:
                 lines = result.stdout.splitlines()
-                filtered = [l for l in lines if "kin cron" not in l and "kindex" not in l]
+                # Match only our installed shapes — a bare "remind check"
+                # marker could delete an unrelated user line.
+                filtered = [l for l in lines
+                            if "kin cron" not in l and "kindex" not in l
+                            and "remind check --all-profiles" not in l]
                 if len(filtered) < len(lines):
                     if not dry_run:
                         new_crontab = "\n".join(filtered) + "\n"
                         subprocess.run(["crontab", "-"], input=new_crontab,
                                        capture_output=True, text=True)
-                    actions = ["Removed crontab entry"]
+                    actions = ["Removed crontab entries"]
                 else:
                     actions = ["No crontab entry found"]
             else:
                 actions = ["No crontab found"]
     else:
+        # Install the maintenance job AND a dedicated reminder-check job:
+        # reminder delivery must never wait behind a slow maintenance run.
         if method == "launchd":
-            from .setup import install_launchd
+            from .setup import install_launchd, install_reminder_daemon
             actions = install_launchd(cfg, dry_run=dry_run)
+            actions += install_reminder_daemon(cfg, dry_run=dry_run)
         else:
             from .setup import install_crontab
             actions = install_crontab(cfg, dry_run=dry_run)
@@ -6017,6 +6044,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     es = embed_sub.add_parser("drain", help="Drain queued embedding work")
     es.add_argument("--max-jobs", type=int, help="Maximum queued nodes to embed")
+    es.add_argument("--time-budget", type=float, dest="time_budget",
+                    help="Wall-clock seconds cap (0 = unlimited; "
+                         "default: embedding.drain_time_budget)")
     _common(es)
     es.set_defaults(func=cmd_embed)
 
@@ -6426,6 +6456,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--conversation-id", help="Scope reminder to this conversation/session id")
     s.add_argument("--scope", dest="reminder_scope", choices=["chat", "global"],
                    help="Visibility scope for hook injection")
+    s.add_argument("--all-profiles", dest="all_profiles", action="store_true",
+                   help="Check reminders across all configured profiles (for check)")
     _common(s)
     s.set_defaults(func=cmd_remind)
 
