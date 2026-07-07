@@ -2007,7 +2007,7 @@ def remind_exec(id: str) -> str:
         return f"Error: Reminder not found: {id}"
     if not has_action(r):
         return f"Error: Reminder {id} has no action defined."
-    result = execute_action(store, r, config)
+    result = execute_action(store, r, config, manual=True)
     return f"Action {result['status']}: {result.get('output', '')[:500]}"
 
 

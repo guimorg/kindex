@@ -498,8 +498,10 @@ def advance_recurring(store: Store, reminder_id: str) -> str | None:
     # A live "running" marker is left alone — resetting it would let the next
     # occurrence overlap an execution still in flight; if the runner died, the
     # stale-reclaim in execute_action recovers it on the next attempt.
+    # "paused" (staleness parking) is also preserved — only a deliberate
+    # manual exec may resume a parked job.
     extra = dict(r.get("extra") or {})
-    if extra.get("action_status") and extra["action_status"] != "running":
+    if extra.get("action_status") and extra["action_status"] not in ("running", "paused"):
         extra["action_status"] = "pending"
         updates["extra"] = extra
 
@@ -573,6 +575,27 @@ def _release_check_lock(store: Store, token: str) -> None:
     store.conn.commit()
 
 
+def _action_is_stale(reminder: dict, config: Config) -> bool:
+    """True when a due reminder's action is too overdue to auto-execute.
+
+    Staleness anchors to the effective trigger time: a snoozed reminder was
+    explicitly deferred, so its snooze expiry — not the original next_due —
+    is when it became actionable. Without that anchor a deliberate 48h snooze
+    would be misclassified as an abandoned backlog the moment it expired.
+    """
+    max_overdue = int(getattr(config.reminders, "max_action_overdue", 86400) or 0)
+    if max_overdue <= 0:
+        return False
+    try:
+        anchor = datetime.datetime.fromisoformat(reminder["next_due"])
+        snooze = reminder.get("snooze_until")
+        if snooze:
+            anchor = max(anchor, datetime.datetime.fromisoformat(snooze))
+        return (_now_dt() - anchor).total_seconds() > max_overdue
+    except (KeyError, ValueError, TypeError):
+        return True  # no parseable trigger time — no basis to claim it's fresh
+
+
 def check_and_fire(
     store: Store,
     config: Config,
@@ -633,9 +656,18 @@ def _check_and_fire_locked(
         # Dispatch notification
         dispatch(r, config, channel_names=channels)
 
-        # Execute action if present and enabled
-        if config.reminders.action_enabled:
-            from .actions import execute_action, has_action
+        # Execute action if present, enabled, and not stale. The staleness
+        # guard is a hard safety line: a wake reminder minutes overdue is a
+        # live workflow and executes; one overdue by more than
+        # max_action_overdue means the workflow it belonged to is long gone —
+        # auto-executing it (worst case: a first-ever scheduler install
+        # discovering months of due pollers) detonates a swarm of headless
+        # agents. Stale ones notify only; run `kin remind exec` to run one
+        # deliberately.
+        from .actions import execute_action, has_action
+
+        stale = _action_is_stale(r, config)
+        if config.reminders.action_enabled and not stale:
             if has_action(r):
                 result = execute_action(store, r, config)
                 if result.get("status") == "completed":
@@ -649,6 +681,12 @@ def _check_and_fire_locked(
         if r["reminder_type"] == "recurring":
             # Advance to next occurrence
             advance_recurring(store, r["id"])
+            if stale and has_action(r):
+                # Advancing re-arms the action for an occurrence one period
+                # away — which would resurrect a stale poller swarm, merely
+                # time-shifted. Park it instead: notify-only every occurrence
+                # until a deliberate `kin remind exec` resumes the job.
+                _pause_action(store, r["id"])
         else:
             # Mark as fired (pending user action)
             store.update_reminder(r["id"], status="fired", last_fired=_now())
@@ -656,6 +694,16 @@ def _check_and_fire_locked(
         fired.append(r)
 
     return fired
+
+
+def _pause_action(store: Store, reminder_id: str) -> None:
+    """Mark a reminder's action paused — sweeps skip it, manual exec resumes."""
+    r = store.get_reminder(reminder_id)
+    if r is None:
+        return
+    extra = dict(r.get("extra") or {})
+    extra["action_status"] = "paused"
+    store.update_reminder(reminder_id, extra=extra)
 
 
 def auto_snooze_stale(store: Store, config: Config) -> int:

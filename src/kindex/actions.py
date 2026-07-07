@@ -81,10 +81,14 @@ def execute_action(
     config: Config,
     *,
     timeout: int = 300,
+    manual: bool = False,
 ) -> dict:
     """Execute a reminder's action.  Returns ``{"status": ..., "output": ...}``.
 
     Updates the reminder's ``extra`` with ``action_status`` and ``action_result``.
+    ``manual=True`` marks a deliberate user invocation (``kin remind exec`` /
+    MCP ``remind_exec``): it may resume a ``paused`` action, which automated
+    sweeps must skip.
     """
     fields = get_action_fields(reminder)
     if not has_action(reminder):
@@ -92,6 +96,9 @@ def execute_action(
 
     if fields["action_status"] == "completed":
         return {"status": "skipped", "reason": "already completed"}
+    if fields["action_status"] == "paused" and not manual:
+        # Parked by the staleness guard — only a deliberate exec resumes it.
+        return {"status": "skipped", "reason": "paused (stale); run kin remind exec to resume"}
     if fields["action_status"] == "running" and not _running_is_stale(reminder, timeout):
         return {"status": "skipped", "reason": "already running"}
 

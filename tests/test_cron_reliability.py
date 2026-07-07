@@ -625,6 +625,186 @@ class TestConcurrencyGuards:
         assert real_get(rid)["status"] == "done"
 
 
+# ── Staleness guard: stale backlogs must not auto-execute ────────────
+
+
+class TestActionStalenessGuard:
+    def _actionable(self, store, *, overdue_seconds, recurring=False):
+        due = (
+            datetime.datetime.now() - datetime.timedelta(seconds=overdue_seconds)
+        ).isoformat(timespec="seconds")
+        kwargs = {"extra": {"action_command": "echo hi", "action_mode": "shell"}}
+        if recurring:
+            kwargs.update(reminder_type="recurring", schedule="FREQ=HOURLY")
+        return store.add_reminder("actionable", due, **kwargs)
+
+    def test_fresh_overdue_action_executes(self, config, store, monkeypatch):
+        """Minutes overdue — a live reentry wake — executes immediately."""
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        self._actionable(store, overdue_seconds=300)
+
+        check_and_fire(store, config)
+        assert len(runs) == 1
+
+    def test_stale_action_notifies_but_does_not_execute(self, config, store, monkeypatch):
+        """Overdue past max_action_overdue: notification fires, action does not
+        — a first-install backlog cannot detonate a swarm of headless agents."""
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        rid = self._actionable(store, overdue_seconds=3 * 86400)
+
+        fired = check_and_fire(store, config)
+
+        assert runs == []
+        assert [r["id"] for r in fired] == [rid]
+        # Fired-pending: the action stays available for a deliberate
+        # `kin remind exec`
+        r = store.get_reminder(rid)
+        assert r["status"] == "fired"
+        assert (r["extra"] or {}).get("action_status", "pending") == "pending"
+
+    def test_stale_recurring_is_parked_not_just_delayed(self, config, store, monkeypatch):
+        """A stale recurring poller must not resume one period later — the
+        advance re-arms it, so without parking the swarm returns synchronized.
+        Sweeps after the advance must still not execute."""
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        rid = self._actionable(store, overdue_seconds=3 * 86400, recurring=True)
+
+        check_and_fire(store, config)
+
+        assert runs == []
+        r = store.get_reminder(rid)
+        assert r["status"] == "active"  # advanced to the next occurrence
+        assert datetime.datetime.fromisoformat(r["next_due"]) > datetime.datetime.now()
+        assert r["extra"]["action_status"] == "paused"
+
+        # One period later: the occurrence is fresh-overdue, but the parked
+        # action must still not auto-execute.
+        store.update_reminder(rid, next_due=_past())
+        check_and_fire(store, config)
+        assert runs == []
+        assert store.get_reminder(rid)["extra"]["action_status"] == "paused"
+
+    def test_manual_exec_resumes_parked_recurring(self, config, store, monkeypatch):
+        """kin remind exec resumes a parked poller; it auto-executes again on
+        the following occurrences."""
+        from kindex import actions
+        from kindex.actions import execute_action
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        rid = self._actionable(store, overdue_seconds=3 * 86400, recurring=True)
+        check_and_fire(store, config)  # parks it
+        assert store.get_reminder(rid)["extra"]["action_status"] == "paused"
+
+        # Sweep-context exec still refuses; deliberate manual exec resumes
+        assert execute_action(store, store.get_reminder(rid), config)["status"] == "skipped"
+        assert execute_action(
+            store, store.get_reminder(rid), config, manual=True
+        )["status"] == "completed"
+        assert len(runs) == 1
+
+        # Next occurrence auto-executes again (completed -> pending on advance)
+        from kindex.reminders import advance_recurring
+        advance_recurring(store, rid)
+        store.update_reminder(rid, next_due=_past())
+        check_and_fire(store, config)
+        assert len(runs) == 2
+
+    def test_snoozed_action_executes_on_snooze_expiry(self, config, store, monkeypatch):
+        """An explicit long snooze is a deferral, not staleness: the action
+        must execute when the snooze expires even if next_due is days old."""
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        rid = self._actionable(store, overdue_seconds=2 * 86400)
+        just_expired = (
+            datetime.datetime.now() - datetime.timedelta(seconds=10)
+        ).isoformat(timespec="seconds")
+        store.snooze_reminder(rid, just_expired)
+
+        check_and_fire(store, config)
+        assert len(runs) == 1
+
+    def test_unparseable_due_time_does_not_abort_sweep(self, config, store, monkeypatch):
+        """A reminder with a malformed/aware next_due is treated as stale —
+        it must not crash the sweep for everyone else."""
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        bad = self._actionable(store, overdue_seconds=300)
+        store.update_reminder(bad, next_due="2026-07-07T00:00:00+00:00")
+        good = self._actionable(store, overdue_seconds=300)
+
+        fired = check_and_fire(store, config)
+
+        assert len(runs) == 1  # only the well-formed one executed
+        assert {r["id"] for r in fired} >= {good}
+
+    def test_guard_disabled_with_zero(self, config, store, monkeypatch):
+        from kindex import actions
+        from kindex.reminders import check_and_fire
+
+        _quiet_notify(monkeypatch)
+        config.reminders.action_enabled = True
+        config.reminders.max_action_overdue = 0
+        runs = []
+        monkeypatch.setattr(
+            actions, "_run_shell",
+            lambda cmd, **kw: runs.append(cmd) or {"ok": True, "output": ""},
+        )
+        self._actionable(store, overdue_seconds=30 * 86400)
+
+        check_and_fire(store, config)
+        assert len(runs) == 1
+
+
 # ── Late-due re-check and disabled/fault paths ───────────────────────
 
 

@@ -303,6 +303,12 @@ class ReminderConfig(BaseModel):
     auto_snooze_timeout: int = 300
     idle_suppress_after: int = 600
     action_enabled: bool = True        # enable action execution on reminder fire
+    # Never auto-execute an action overdue by more than this many seconds —
+    # notify only. A freshly-due reentry wake (minutes overdue) executes
+    # immediately; a backlog of stale pollers discovered by a first-ever
+    # scheduler install must not detonate as a swarm of headless agents.
+    # 0 disables the guard.
+    max_action_overdue: int = 86400
     stop_guard_enabled: bool = False   # block Claude exit for pending actions (noisy; opt-in)
     dream_on_stop_enabled: bool = True  # run throttled knowledge consolidation when Claude exits
     dream_min_interval: int = 3600      # seconds between scheduled/hook dream runs

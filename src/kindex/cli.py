@@ -3885,7 +3885,7 @@ def cmd_remind(args):
             print(f"Reminder {rid} has no action defined.", file=sys.stderr)
             store.close()
             return
-        result = execute_action(store, r, cfg)
+        result = execute_action(store, r, cfg, manual=True)
         if getattr(args, "json", False):
             print(_dumps(result))
         else:
