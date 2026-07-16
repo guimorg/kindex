@@ -670,6 +670,7 @@ Ingest repository structure with `kin ingest code --directory .`:
 - **Three extraction tiers** — ctags (100+ languages), cscope (C/C++ cross-refs), tree-sitter (AST call graphs)
 - **Resilient fallback** — unsupported or untagged files still become module nodes; available tree-sitter parsers can still enrich those modules, with fallback provenance retained in metadata
 - **Incremental** — file hashing skips unchanged files on re-ingest
+- **Unity projects (opt-in)** — `--unity` (or `code_ingest: {unity: true}` in `.kin/config`) indexes serialized assets (`.unity`, `.prefab`, `.asset`, `.mat`, `.controller`, `.anim`), sniffs text-vs-binary serialization, and attaches each asset's `.meta` GUID so models can resolve GUID-based references; `code_ingest.include_extensions` maps further extensions (e.g. `.shader: Unity Shader`)
 
 Code structure lives in the same graph as your decisions, watches, and constraints. Search finds both what calls a function and what broke last time someone changed it.
 

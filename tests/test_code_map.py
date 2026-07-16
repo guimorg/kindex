@@ -93,6 +93,53 @@ def test_export_understand_anything_projection(tmp_path):
     assert graph["tour"]
 
 
+def test_export_includes_unity_guid_in_language_notes(tmp_path):
+    guid = "0123456789abcdef0123456789abcdef"
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    store = Store(cfg)
+    try:
+        store.add_node(
+            "Assets/Player.prefab",
+            content="Module Assets/Player.prefab",
+            node_id="code-mod-demo-prefab",
+            node_type="artifact",
+            domains=["code", "unity prefab"],
+            prov_activity="code-ingest",
+            extra={
+                "relative_path": "Assets/Player.prefab",
+                "repo_root": str(tmp_path),
+                "language": "Unity Prefab",
+                "unity_guid": guid,
+            },
+        )
+        store.add_node(
+            "src/app.py",
+            content="Module src/app.py",
+            node_id="code-mod-demo-app",
+            node_type="artifact",
+            domains=["code", "python"],
+            prov_activity="code-ingest",
+            extra={
+                "relative_path": "src/app.py",
+                "repo_root": str(tmp_path),
+                "language": "Python",
+            },
+        )
+
+        graph = export_understand_anything(
+            store,
+            directory=tmp_path,
+            project_name="demo",
+        )
+    finally:
+        store.close()
+
+    by_name = {n["name"]: n for n in graph["nodes"]}
+    assert by_name["Assets/Player.prefab"]["languageNotes"]["unityGuid"] == guid
+    # Non-Unity nodes must not churn existing code-maps with a new key
+    assert "unityGuid" not in by_name["src/app.py"]["languageNotes"]
+
+
 def test_export_understand_anything_filters_by_repo_root(tmp_path):
     cfg = Config(data_dir=str(tmp_path / "data"))
     store = Store(cfg)

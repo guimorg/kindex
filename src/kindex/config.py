@@ -339,6 +339,19 @@ class WorkPolicyConfig(BaseModel):
     git: GitPolicyConfig = Field(default_factory=GitPolicyConfig)
 
 
+class CodeIngestConfig(BaseModel):
+    """Project-scoped `kin ingest code` options, set in .kin/config.
+
+    unity: opt-in Unity preset — index serialized asset files
+    (.unity/.prefab/.asset/...) and attach .meta GUIDs to module nodes.
+    include_extensions: generic escape hatch mapping extra extensions to
+    language labels, e.g. {".shader": "Unity Shader"}.
+    """
+
+    unity: bool = False
+    include_extensions: dict[str, str] = Field(default_factory=dict)
+
+
 class Config(BaseModel):
     _project_path: Path | None = PrivateAttr(default=None)
     # Per-pass session routing predicate (set by daemon.cron_run_all and
@@ -375,6 +388,7 @@ class Config(BaseModel):
     ranking: RankingConfig = Field(default_factory=RankingConfig)
     reminders: ReminderConfig = Field(default_factory=ReminderConfig)
     work_policy: WorkPolicyConfig = Field(default_factory=WorkPolicyConfig)
+    code_ingest: CodeIngestConfig = Field(default_factory=CodeIngestConfig)
     # Sequestered multi-profile storage. Profiles live in the GLOBAL kin.yaml:
     #   profiles: {work: {data_dir: ~/.kindex-work, roots: [~/Work]}}
     #   default_profile: personal

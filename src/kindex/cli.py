@@ -1253,7 +1253,7 @@ def cmd_ingest(args):
 
     # Collect adapter-specific kwargs
     extra = {}
-    for key in ("repo", "repo_path", "team", "directory"):
+    for key in ("repo", "repo_path", "team", "directory", "unity"):
         val = getattr(args, key, None)
         if val is not None:
             extra[key] = val
@@ -5907,6 +5907,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--since", type=str, default=None, help="ISO date to filter items created after")
     s.add_argument("--team", type=str, default=None, help="Linear team key (for linear source)")
     s.add_argument("--directory", type=str, default=None, help="Directory to ingest (for files source)")
+    # default=None so an absent flag defers to the project's .kin/config
+    # code_ingest.unity setting
+    s.add_argument("--unity", action="store_true", default=None,
+                   help="Include Unity asset files (.unity/.prefab/.asset) and "
+                        ".meta GUIDs (code source; also via .kin/config code_ingest.unity)")
     _common(s)
     s.set_defaults(func=cmd_ingest)
 

@@ -39,6 +39,34 @@ def test_load_config_from_explicit_project_path(tmp_path):
     assert cfg.work_policy.linear.team == "ENG"
 
 
+def test_code_ingest_from_kin_config(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_kin_config(
+        project,
+        "code_ingest:\n"
+        "  unity: true\n"
+        "  include_extensions:\n"
+        "    .shader: Unity Shader\n",
+    )
+
+    cfg = load_config(project_path=project)
+
+    assert cfg.code_ingest.unity is True
+    assert cfg.code_ingest.include_extensions == {".shader": "Unity Shader"}
+
+
+def test_code_ingest_defaults_off(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write_kin_config(project, "data_dir: /tmp/kindex-project\n")
+
+    cfg = load_config(project_path=project)
+
+    assert cfg.code_ingest.unity is False
+    assert cfg.code_ingest.include_extensions == {}
+
+
 def test_kin_project_config_inheritance_merges_lists_and_policy(tmp_path):
     org = tmp_path / "org"
     project = tmp_path / "project"

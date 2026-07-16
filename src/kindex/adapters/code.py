@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 from fnmatch import fnmatch
@@ -167,6 +168,27 @@ _LANGUAGE_BY_EXTENSION = {
 
 _CODE_EXTENSIONS = set(_LANGUAGE_BY_EXTENSION)
 
+# Unity serialized-asset extensions — opt-in via code_ingest.unity in
+# .kin/config or `kin ingest code --unity` (issue #17). These are YAML
+# when the project uses text serialization, binary otherwise; content is
+# never parsed here, only sniffed (see _sniff_serialization).
+_UNITY_LANGUAGE_BY_EXTENSION = {
+    ".unity": "Unity Scene",
+    ".prefab": "Unity Prefab",
+    ".asset": "Unity Asset",
+    ".mat": "Unity Material",
+    ".controller": "Unity Animator",
+    ".anim": "Unity Animation",
+}
+
+# Unity build/cache output that must never be indexed.
+_UNITY_EXCLUDES = [
+    "Library/*", "Temp/*", "Logs/*", "obj/*", "Build/*", "UserSettings/*",
+]
+
+# GUID line in a .meta sidecar, e.g. "guid: 0123456789abcdef0123456789abcdef"
+_UNITY_GUID_RE = re.compile(r"^guid:\s*([0-9a-fA-F]{32})\s*$", re.MULTILINE)
+
 # Universal Ctags supports TypeScript but does not map `.tsx` by default.
 _CTAGS_EXTENSION_MAPS = [
     "--map-TypeScript=+.tsx",
@@ -181,13 +203,15 @@ _DEFAULT_EXCLUDES = [
 ]
 
 
-def _walk_files(root: Path, exclude: list[str]) -> list[Path]:
+def _walk_files(root: Path, exclude: list[str],
+                extensions: set[str] | None = None) -> list[Path]:
     """Walk directory tree, filtering by code extensions and exclude patterns."""
+    extensions = extensions or _CODE_EXTENSIONS
     files = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in _CODE_EXTENSIONS:
+        if path.suffix.lower() not in extensions:
             continue
         rel = str(path.relative_to(root))
         if any(fnmatch(rel, pat) for pat in exclude):
@@ -200,15 +224,17 @@ def _walk_files(root: Path, exclude: list[str]) -> list[Path]:
 
 
 def _get_file_list(directory: Path, repo_root: Path | None,
-                   exclude: list[str]) -> list[Path]:
+                   exclude: list[str],
+                   extensions: set[str] | None = None) -> list[Path]:
     """Get list of source files, preferring git ls-files."""
+    extensions = extensions or _CODE_EXTENSIONS
     if repo_root:
         all_files = _git_ls_files(repo_root)
         if all_files:
             # Filter to code files within the target directory, apply excludes
             result = []
             for f in all_files:
-                if not f.suffix.lower() in _CODE_EXTENSIONS:
+                if not f.suffix.lower() in extensions:
                     continue
                 try:
                     rel = str(f.relative_to(directory))
@@ -218,7 +244,7 @@ def _get_file_list(directory: Path, repo_root: Path | None,
                     continue
                 result.append(f)
             return sorted(result)
-    return _walk_files(directory, exclude)
+    return _walk_files(directory, exclude, extensions)
 
 
 # ── ctags extraction (Tier A) ──────────────────────────────────────
@@ -352,12 +378,45 @@ def _is_public(tag: dict) -> bool:
     return True
 
 
-def _infer_language(path: Path, tags: list[dict]) -> str:
+def _infer_language(path: Path, tags: list[dict],
+                    lang_by_ext: dict[str, str] | None = None) -> str:
     """Prefer ctags language, then use the source extension as fallback."""
     for tag in tags:
         if tag.get("language"):
             return tag["language"]
-    return _LANGUAGE_BY_EXTENSION.get(path.suffix.lower(), "Unknown")
+    return (lang_by_ext or _LANGUAGE_BY_EXTENSION).get(path.suffix.lower(), "Unknown")
+
+
+def _sniff_serialization(path: Path) -> str:
+    """Classify an asset file as text or binary serialization.
+
+    Unity text serialization always starts with a "%YAML 1.1" header;
+    binary assets contain NUL bytes early. Reads at most 64 bytes.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return "unreadable"
+    if head.startswith(b"%YAML"):
+        return "text"
+    return "binary" if b"\x00" in head else "text"
+
+
+def _unity_guid(path: Path) -> str:
+    """Read the asset GUID from a Unity .meta sidecar, if present.
+
+    Unity assets reference each other by GUID, not file name, so the
+    GUID is what lets models resolve cross-asset references.
+    """
+    meta = path.with_name(path.name + ".meta")
+    try:
+        if not meta.is_file():
+            return ""
+        match = _UNITY_GUID_RE.search(meta.read_text(errors="replace")[:2048])
+    except OSError:
+        return ""
+    return match.group(1).lower() if match else ""
 
 
 def _count_lines(path: Path) -> int:
@@ -908,12 +967,18 @@ def ingest_code(
     limit: int | None = None,
     verbose: bool = False,
     exclude: list[str] | None = None,
+    unity: bool = False,
+    extra_extensions: dict[str, str] | None = None,
 ) -> IngestResult:
     """Ingest code structure from a directory into the knowledge graph.
 
     Analysis is fully local (ctags/cscope/tree-sitter, no LLM calls), so
     limit defaults to unlimited. None, 0, or negative all mean unlimited;
     a positive limit caps created+updated nodes and reports truncation.
+
+    unity opts in to Unity serialized assets (.unity/.prefab/.asset/...)
+    with .meta GUID attachment; extra_extensions maps additional
+    extensions to language labels (".shader" -> "Unity Shader").
     """
     directory = Path(directory).resolve()
     if not directory.is_dir():
@@ -922,7 +987,18 @@ def ingest_code(
     if limit is not None and limit <= 0:
         limit = None
 
-    exclude_patterns = exclude or list(_DEFAULT_EXCLUDES)
+    exclude_patterns = list(exclude) if exclude else list(_DEFAULT_EXCLUDES)
+
+    lang_by_ext = dict(_LANGUAGE_BY_EXTENSION)
+    if unity:
+        lang_by_ext.update(_UNITY_LANGUAGE_BY_EXTENSION)
+        exclude_patterns.extend(_UNITY_EXCLUDES)
+    if extra_extensions:
+        lang_by_ext.update({
+            (ext if ext.startswith(".") else f".{ext}").lower(): label
+            for ext, label in extra_extensions.items()
+        })
+    extensions = set(lang_by_ext)
 
     # Detect repo
     repo_info = _detect_repo(directory)
@@ -934,16 +1010,19 @@ def ingest_code(
     # tree-sitter checked per-language later
 
     # Get file list
-    files = _get_file_list(directory, repo_root, exclude_patterns)
+    files = _get_file_list(directory, repo_root, exclude_patterns, extensions)
     if verbose:
         print(f"  Found {len(files)} source files in {directory}")
 
     if not files:
         return IngestResult()
 
-    # Run ctags on all files
+    # Run ctags on code files only — asset files added via unity/
+    # extra_extensions have no ctags parser, and feeding them in would
+    # make the per-file retry after a failed batch O(assets).
     effective_root = repo_root or directory
-    tags = _run_ctags(files, effective_root)
+    ctags_files = [f for f in files if f.suffix.lower() in _CODE_EXTENSIONS]
+    tags = _run_ctags(ctags_files, effective_root) if ctags_files else []
     if verbose:
         print(f"  ctags produced {len(tags)} tags")
 
@@ -1010,13 +1089,18 @@ def ingest_code(
             continue
 
         # Determine language from ctags when possible, then from extension.
-        language = _infer_language(abs_path, file_tags)
+        language = _infer_language(abs_path, file_tags, lang_by_ext)
         language_source = (
             "ctags"
             if any(tag.get("language") for tag in file_tags)
             else "extension"
         )
-        line_count = _count_lines(abs_path)
+        # Asset files from unity/extra_extensions may be binary; sniff
+        # before reading (_count_lines slurps the whole file).
+        serialization = ""
+        if abs_path.suffix.lower() not in _CODE_EXTENSIONS:
+            serialization = _sniff_serialization(abs_path)
+        line_count = 0 if serialization == "binary" else _count_lines(abs_path)
 
         content = _build_module_content(
             rel_path,
@@ -1042,6 +1126,12 @@ def ingest_code(
             "tool_tier": "A",
             "repo_root": str(effective_root),
         }
+        if serialization:
+            extra["serialization"] = serialization
+        if unity:
+            guid = _unity_guid(abs_path)
+            if guid:
+                extra["unity_guid"] = guid
 
         title = rel_path  # Use relative path as title — most useful for search
 
@@ -1264,7 +1354,7 @@ def ingest_code(
     lang_files: dict[str, list[tuple[str, Path]]] = {}
     for abs_path_str, file_tags in grouped.items():
         abs_path = Path(abs_path_str)
-        language = _infer_language(abs_path, file_tags)
+        language = _infer_language(abs_path, file_tags, lang_by_ext)
         if language != "Unknown":
             try:
                 rel_path = str(abs_path.relative_to(effective_root))
@@ -1433,6 +1523,8 @@ class CodeAdapter:
         options=[
             AdapterOption("directory", "Repository or directory to analyze", required=True),
             AdapterOption("exclude", "Comma-separated exclude glob patterns"),
+            AdapterOption("unity", "Include Unity asset files (.unity/.prefab/.asset) "
+                                   "and .meta GUIDs"),
         ],
     )
 
@@ -1450,9 +1542,18 @@ class CodeAdapter:
         if exclude_str:
             exclude = [p.strip() for p in exclude_str.split(",") if p.strip()]
 
+        # Unity opt-in: explicit --unity flag wins; otherwise the
+        # project's .kin/config code_ingest section decides.
+        code_ingest = getattr(kwargs.get("_config"), "code_ingest", None)
+        unity = kwargs.get("unity")
+        if unity is None:
+            unity = bool(code_ingest and code_ingest.unity)
+        extra_extensions = dict(code_ingest.include_extensions) if code_ingest else None
+
         return ingest_code(
             store, directory,
             limit=limit, verbose=verbose, exclude=exclude,
+            unity=unity, extra_extensions=extra_extensions,
         )
 
 

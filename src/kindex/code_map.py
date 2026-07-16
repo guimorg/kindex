@@ -357,6 +357,17 @@ def export_understand_anything(
         ua_type = _ua_node_type(node)
         layer = _layer_for_path(str(rel_path), ua_type)
         layer_members.setdefault(layer, []).append(node["id"])
+        # Unity assets reference each other by GUID, so exposing the GUID
+        # alongside filePath gives consumers the GUID->path mapping. Kept
+        # per-node (not a top-level map) because the kin merge driver only
+        # unions known top-level keys.
+        language_notes = {
+            "language": language,
+            "kindexType": node.get("type", ""),
+            "toolTier": extra.get("tool_tier", ""),
+        }
+        if extra.get("unity_guid"):
+            language_notes["unityGuid"] = extra["unity_guid"]
         ua_nodes.append({
             "id": node["id"],
             "type": ua_type,
@@ -365,11 +376,7 @@ def export_understand_anything(
             "summary": _summary(node),
             "tags": sorted(set(node.get("domains") or [])),
             "complexity": _complexity(node),
-            "languageNotes": {
-                "language": language,
-                "kindexType": node.get("type", ""),
-                "toolTier": extra.get("tool_tier", ""),
-            },
+            "languageNotes": language_notes,
         })
 
     ua_edges = []
