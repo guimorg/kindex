@@ -1247,7 +1247,7 @@ def cmd_ingest(args):
 
     config = IngestConfig(
         since=getattr(args, "since", None),
-        limit=getattr(args, "limit", 50) or 50,
+        limit=getattr(args, "limit", None),
         verbose=True,
     )
 
@@ -5898,7 +5898,9 @@ def build_parser() -> argparse.ArgumentParser:
         _adapter_names = ["projects", "sessions", "files", "commits", "github", "linear"]
     s.add_argument("source", choices=_adapter_names + ["all"],
                    help="Adapter name or 'all' for all available sources")
-    s.add_argument("--limit", type=int, default=50, help="Max items to ingest")
+    s.add_argument("--limit", type=int, default=None,
+                   help="Max items to ingest (0 = unlimited; default depends on "
+                        "adapter — code is unlimited, network/LLM adapters cap at 50)")
     s.add_argument("--repo", type=str, default=None, help="GitHub owner/repo (e.g. jmcentire/kindex)")
     s.add_argument("--repo-path", type=str, default=None,
                    help="Local repository path (for commits source)")

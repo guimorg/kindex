@@ -905,14 +905,22 @@ def ingest_code(
     store: "Store",
     directory: str | Path,
     *,
-    limit: int = 200,
+    limit: int | None = None,
     verbose: bool = False,
     exclude: list[str] | None = None,
 ) -> IngestResult:
-    """Ingest code structure from a directory into the knowledge graph."""
+    """Ingest code structure from a directory into the knowledge graph.
+
+    Analysis is fully local (ctags/cscope/tree-sitter, no LLM calls), so
+    limit defaults to unlimited. None, 0, or negative all mean unlimited;
+    a positive limit caps created+updated nodes and reports truncation.
+    """
     directory = Path(directory).resolve()
     if not directory.is_dir():
         return IngestResult(errors=[f"Not a directory: {directory}"])
+
+    if limit is not None and limit <= 0:
+        limit = None
 
     exclude_patterns = exclude or list(_DEFAULT_EXCLUDES)
 
@@ -948,6 +956,9 @@ def ingest_code(
     updated = 0
     skipped = 0
     errors: list[str] = []
+    warnings: list[str] = []
+    truncated = False
+    processed_files = 0
     all_node_ids: list[str] = []
 
     # Maps for edge creation: qualified_name -> node_id
@@ -956,8 +967,10 @@ def ingest_code(
 
     # Phase 1: Create module and symbol nodes from ctags
     for abs_path_str, file_tags in grouped.items():
-        if created + updated >= limit:
+        if limit is not None and created + updated >= limit:
+            truncated = True
             break
+        processed_files += 1
 
         abs_path = Path(abs_path_str)
         try:
@@ -1054,7 +1067,8 @@ def ingest_code(
 
         # --- Symbol nodes (Tier 2) — classes/interfaces/types ---
         for t in file_tags:
-            if created + updated >= limit:
+            if limit is not None and created + updated >= limit:
+                truncated = True
                 break
             if t.get("kind") not in _CLASS_KINDS:
                 continue
@@ -1399,7 +1413,15 @@ def ingest_code(
     # Link all code nodes to project
     _link_to_project(store, repo_slug, all_node_ids)
 
-    return IngestResult(created=created, updated=updated, skipped=skipped, errors=errors)
+    if truncated:
+        msg = (f"limit {limit} reached after {processed_files} of "
+               f"{len(grouped)} files; pass --limit 0 to ingest everything")
+        if verbose:
+            print(f"  Warning: {msg}")
+        warnings.append(msg)
+
+    return IngestResult(created=created, updated=updated, skipped=skipped,
+                        errors=errors, warnings=warnings)
 
 
 # ── Adapter protocol wrapper ───────────────────────────────────────
@@ -1417,7 +1439,7 @@ class CodeAdapter:
     def is_available(self) -> bool:
         return _check_ctags()
 
-    def ingest(self, store: "Store", *, limit: int = 200, since: str | None = None,
+    def ingest(self, store: "Store", *, limit: int | None = None, since: str | None = None,
                verbose: bool = False, **kwargs: Any) -> IngestResult:
         directory = kwargs.get("directory")
         if not directory:

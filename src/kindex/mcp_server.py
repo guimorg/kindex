@@ -1066,12 +1066,13 @@ def changelog(since: str = "", days: int = 7) -> str:
 
 
 @mcp.tool()
-def ingest(source: str, limit: int = 50, repo: str = "", since: str = "") -> str:
+def ingest(source: str, limit: int = 0, repo: str = "", since: str = "") -> str:
     """Ingest knowledge from external sources.
 
     Args:
         source: Adapter name (github, linear, files, commits, projects, sessions) or 'all'.
-        limit: Maximum items to ingest per adapter.
+        limit: Maximum items to ingest per adapter (0 = each adapter's own default;
+            code is unlimited, network/LLM adapters cap at 50).
         repo: GitHub owner/repo for github adapter (e.g. 'jmcentire/kindex').
         since: ISO date — only ingest items after this date.
     """
@@ -1079,7 +1080,9 @@ def ingest(source: str, limit: int = 50, repo: str = "", since: str = "") -> str
     from .adapters.registry import discover, get
 
     store, cfg = _get_store()
-    config = IngestConfig(since=since or None, limit=limit, verbose=False)
+    config = IngestConfig(since=since or None,
+                          limit=limit if limit > 0 else None,
+                          verbose=False)
     extra: dict = {"_config": cfg}
     if repo:
         extra["repo"] = repo

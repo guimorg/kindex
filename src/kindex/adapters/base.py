@@ -66,6 +66,7 @@ class IngestResult:
     updated: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -81,7 +82,10 @@ class IngestResult:
             parts.append(f"{self.skipped} skipped")
         if self.errors:
             parts.append(f"{len(self.errors)} errors")
-        return ", ".join(parts) if parts else "no changes"
+        summary = ", ".join(parts) if parts else "no changes"
+        for w in self.warnings:
+            summary += f"\n  WARNING: {w}"
+        return summary
 
 
 @runtime_checkable

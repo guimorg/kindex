@@ -130,7 +130,7 @@ If a repo tracks `.kin/`, treat it as shipped project state:
 Run these before committing code that changes project structure:
 
 ```bash
-kin ingest code --directory . --limit 10000
+kin ingest code --directory .
 kin index
 kin export code-map --directory . --project-name kindex --output .kin/code-map.json
 ```

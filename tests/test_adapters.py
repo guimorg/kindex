@@ -543,6 +543,12 @@ class TestIngestResult:
     def test_str_with_errors(self):
         assert "2 errors" in str(IngestResult(errors=["a", "b"]))
 
+    def test_str_with_warnings(self):
+        r = IngestResult(created=1, warnings=["limit 2 reached after 2 of 5 files"])
+        s = str(r)
+        assert "1 created" in s
+        assert "WARNING: limit 2 reached" in s
+
 
 class TestAdapterProtocol:
     def test_stub_is_adapter(self):
