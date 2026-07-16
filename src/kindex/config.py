@@ -416,6 +416,18 @@ class Config(BaseModel):
         return Path(self.data_dir).expanduser().resolve()
 
     @property
+    def scheduler_log_path(self) -> Path:
+        """Log dir for machine-level schedulers (cron/launchd).
+
+        The scheduled jobs span ALL profiles (kin cron, kin remind check
+        --all-profiles), so their logs always live under the BASE
+        (pre-profile-activation) data dir — never whichever profile
+        happened to resolve from the cwd when setup-cron ran (issue #15).
+        """
+        base = self._legacy_data_dir or self.data_dir
+        return Path(base).expanduser().resolve() / "logs"
+
+    @property
     def topics_dir(self) -> Path:
         return self.data_path / "topics"
 

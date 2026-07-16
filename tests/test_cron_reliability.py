@@ -1044,17 +1044,54 @@ class TestSchedulerCommandShape:
         # Maintenance is phase-offset from the :00-aligned reminder checker
         assert "2-59/30 * * * *" in written["crontab"]
 
-    def test_crontab_python_module_fallback_dedups(self, config, monkeypatch):
-        """The `python -m kindex.cli` fallback line contains no 'kin cron'
-        substring — re-running setup-cron must not append duplicates, even
-        after a data_dir change invalidates the log-path marker."""
+    def test_crontab_rerun_migrates_stale_log_path(self, config, monkeypatch):
+        """Re-running setup-cron replaces lines whose log path was frozen
+        from a previous data_dir/profile — without appending duplicates and
+        without touching unrelated user lines. Covers the `python -m
+        kindex.cli` fallback shape (no 'kin cron' substring)."""
         from kindex import setup as ksetup
 
         old_logs = "/somewhere/else/logs"  # a previous data_dir's log path
+        user_line = "0 4 * * * /usr/local/bin/backup.sh"
         existing = (
+            f"{user_line}\n"
             f"2-59/30 * * * * /usr/bin/python3 -m kindex.cli cron >> {old_logs}/cron.log 2>&1\n"
             f"*/5 * * * * /usr/bin/python3 -m kindex.cli remind check --all-profiles "
             f">> {old_logs}/reminders.log 2>&1\n"
+        )
+        written = {}
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 0, "stdout": existing, "stderr": ""})()
+            written["crontab"] = kw.get("input", "")
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr("kindex.setup.subprocess.run", fake_run)
+        monkeypatch.setattr(
+            ksetup, "_find_kin_path", lambda: "/usr/bin/python3 -m kindex.cli"
+        )
+
+        actions = ksetup.install_crontab(config)
+
+        new_logs = str(config.scheduler_log_path)
+        assert any(a.startswith("Replaced crontab") for a in actions)
+        assert written["crontab"].count("kindex.cli cron >>") == 1
+        assert written["crontab"].count("remind check --all-profiles") == 1
+        assert old_logs not in written["crontab"]
+        assert f"{new_logs}/cron.log" in written["crontab"]
+        assert f"{new_logs}/reminders.log" in written["crontab"]
+        assert user_line in written["crontab"]
+
+    def test_crontab_rerun_identical_is_noop(self, config, monkeypatch):
+        """When the installed lines already match, nothing is rewritten."""
+        from kindex import setup as ksetup
+
+        logs = str(config.scheduler_log_path)
+        existing = (
+            f"2-59/30 * * * * /usr/local/bin/kin cron >> {logs}/cron.log 2>&1\n"
+            f"*/5 * * * * /usr/local/bin/kin remind check --all-profiles "
+            f">> {logs}/reminders.log 2>&1\n"
         )
         calls = []
 
@@ -1065,13 +1102,38 @@ class TestSchedulerCommandShape:
             return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
         monkeypatch.setattr("kindex.setup.subprocess.run", fake_run)
-        monkeypatch.setattr(
-            ksetup, "_find_kin_path", lambda: "/usr/bin/python3 -m kindex.cli"
-        )
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
 
         actions = ksetup.install_crontab(config)
 
         assert calls == []  # nothing rewritten
+        assert actions == ["Crontab entries already exist"]
+
+    def test_crontab_rerun_preserves_repacked_interval(self, config, monkeypatch):
+        """An adaptively repacked maintenance schedule (same command + log
+        target, different cron fields) must survive a setup-cron re-run."""
+        from kindex import setup as ksetup
+
+        logs = str(config.scheduler_log_path)
+        existing = (
+            f"*/7 * * * * /usr/local/bin/kin cron >> {logs}/cron.log 2>&1\n"
+            f"*/5 * * * * /usr/local/bin/kin remind check --all-profiles "
+            f">> {logs}/reminders.log 2>&1\n"
+        )
+        calls = []
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 0, "stdout": existing, "stderr": ""})()
+            calls.append(kw.get("input", ""))
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr("kindex.setup.subprocess.run", fake_run)
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
+
+        actions = ksetup.install_crontab(config)
+
+        assert calls == []
         assert actions == ["Crontab entries already exist"]
 
     def test_crontab_adds_missing_reminder_line_to_old_install(self, config, monkeypatch):
@@ -1185,3 +1247,125 @@ class TestSchedulerCommandShape:
         assert "remind check --all-profiles" in written["crontab"]
         assert "*/10 * * * *" in written["crontab"]  # 600s -> every 10 min
         assert written["crontab"].count("cron >>") == 1
+
+
+# ── Scheduler log location (issue #15) ───────────────────────────────
+
+
+def _profile_config(tmp_path):
+    """A config whose cwd-resolved profile overwrote data_dir, as when
+    setup-cron runs from inside a profile root."""
+    from kindex.config import _activate_profile
+
+    base = tmp_path / "base"
+    prof = tmp_path / "prof"
+    cfg = Config(
+        data_dir=str(base),
+        profiles={"personal": ProfileEntry(data_dir=str(prof), roots=[])},
+    )
+    return _activate_profile(cfg, "personal", "roots"), base, prof
+
+
+class TestSchedulerLogLocation:
+    def test_scheduler_log_path_without_profile_is_data_dir(self, tmp_path):
+        cfg = Config(data_dir=str(tmp_path / "base"))
+        assert cfg.scheduler_log_path == (tmp_path / "base" / "logs").resolve()
+
+    def test_scheduler_log_path_with_profile_is_base_dir(self, tmp_path):
+        cfg, base, prof = _profile_config(tmp_path)
+        assert cfg.data_path == prof.resolve()
+        assert cfg.scheduler_log_path == (base / "logs").resolve()
+
+    def test_scheduler_log_path_survives_model_copy(self, tmp_path):
+        cfg, base, _prof = _profile_config(tmp_path)
+        copied = cfg.model_copy(deep=True)
+        assert copied.scheduler_log_path == (base / "logs").resolve()
+
+    def test_crontab_logs_to_base_dir_not_active_profile(self, tmp_path, monkeypatch):
+        from kindex import setup as ksetup
+
+        cfg, base, prof = _profile_config(tmp_path)
+        written = {}
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+            written["crontab"] = kw.get("input", "")
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr("kindex.setup.subprocess.run", fake_run)
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
+
+        ksetup.install_crontab(cfg)
+
+        base_logs = str((base / "logs").resolve())
+        assert f">> {base_logs}/cron.log" in written["crontab"]
+        assert f">> {base_logs}/reminders.log" in written["crontab"]
+        assert str(prof) not in written["crontab"]
+
+    def test_crontab_creates_base_log_dir(self, tmp_path, monkeypatch):
+        from kindex import setup as ksetup
+
+        cfg, base, _prof = _profile_config(tmp_path)
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr("kindex.setup.subprocess.run", fake_run)
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
+
+        ksetup.install_crontab(cfg)
+
+        assert (base / "logs").is_dir()
+
+    def test_launchd_plists_log_to_base_dir(self, tmp_path, monkeypatch):
+        import plistlib
+        from pathlib import Path
+
+        from kindex import setup as ksetup
+
+        cfg, base, prof = _profile_config(tmp_path)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "kindex.setup.subprocess.run",
+            lambda *a, **kw: type("P", (), {"returncode": 0, "stdout": ""})(),
+        )
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
+
+        ksetup.install_launchd(cfg)
+        ksetup.install_reminder_daemon(cfg)
+
+        base_logs = str((base / "logs").resolve())
+        agents = tmp_path / "Library" / "LaunchAgents"
+        cron = plistlib.loads((agents / "com.kindex.cron.plist").read_bytes())
+        rem = plistlib.loads((agents / "com.kindex.reminders.plist").read_bytes())
+        assert cron["StandardOutPath"] == f"{base_logs}/cron.log"
+        assert cron["StandardErrorPath"] == f"{base_logs}/cron-error.log"
+        assert rem["StandardOutPath"] == f"{base_logs}/reminders.log"
+        assert str(prof) not in cron["StandardOutPath"]
+
+    def test_apply_crontab_uses_base_log_dir(self, tmp_path, monkeypatch):
+        from kindex import scheduling
+        from kindex import setup as ksetup
+
+        cfg, base, prof = _profile_config(tmp_path)
+        existing = "0 4 * * * /usr/local/bin/backup.sh\n"
+        written = {}
+
+        def fake_run(cmd, **kw):
+            if cmd[:2] == ["crontab", "-l"]:
+                return type("P", (), {"returncode": 0, "stdout": existing, "stderr": ""})()
+            written["crontab"] = kw.get("input", "")
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr("kindex.scheduling.subprocess.run", fake_run)
+        monkeypatch.setattr(ksetup, "_find_kin_path", lambda: "/usr/local/bin/kin")
+
+        result = scheduling._apply_crontab(420, cfg)
+
+        base_logs = str((base / "logs").resolve())
+        assert result["action"] == "updated"
+        assert f">> {base_logs}/cron.log" in written["crontab"]
+        assert str(prof) not in written["crontab"]

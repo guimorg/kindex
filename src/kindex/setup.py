@@ -833,7 +833,7 @@ def install_launchd(config: "Config", dry_run: bool = False) -> list[str]:
     kin_path = _find_kin_path()
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / "com.kindex.cron.plist"
-    log_dir = config.data_path / "logs"
+    log_dir = config.scheduler_log_path
     interval = config.reminders.check_interval
 
     plist_content = _launchd_plist(
@@ -935,27 +935,40 @@ def uninstall_launchd(dry_run: bool = False) -> list[str]:
     return actions
 
 
+def is_kindex_cron_line(line: str) -> bool:
+    """Shape-match every historical kindex crontab line.
+
+    Shared by install (migration), uninstall, and the adaptive repack so
+    the matchers never diverge. Matches the `python -m kindex.cli`
+    fallback shape too (no "kin cron" substring, but "kindex" appears).
+    """
+    return ("kin cron" in line or "kindex" in line
+            or "remind check --all-profiles" in line)
+
+
 def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
     """Install crontab entries for kin maintenance (for Linux/non-macOS).
 
     Two entries: the full maintenance cycle, plus a dedicated frequent
     ``kin remind check --all-profiles`` so reminder delivery never waits
     behind a slow or stalled maintenance run.
+
+    Re-running migrates stale entries in place (e.g. a log path frozen
+    from a previously active profile) instead of reporting them as
+    already installed. A line counts as current when its command and log
+    redirect match; the schedule field is ignored so an adaptively
+    repacked interval (scheduling._apply_crontab) survives re-runs.
     """
     actions = []
     kin_path = _find_kin_path()
-    log_dir = config.data_path / "logs"
+    log_dir = config.scheduler_log_path
 
-    # Markers must match every historical line shape, including the
-    # `python -m kindex.cli` fallback (whose line contains no "kin cron"
-    # substring). The log-file redirect is the stable fingerprint; the legacy
-    # markers keep old installs deduped even after a data_dir change.
     # Maintenance runs at :02/:32 so it is never phase-locked with the
     # reminder checker's :00/:05/... schedule.
     wanted = [
-        ((f"{log_dir}/cron.log", "kin cron", "kindex.cli cron"),
+        (f"{kin_path} cron >> {log_dir}/cron.log 2>&1",
          f"2-59/30 * * * * {kin_path} cron >> {log_dir}/cron.log 2>&1"),
-        ((f"{log_dir}/reminders.log", "remind check --all-profiles"),
+        (f"remind check --all-profiles >> {log_dir}/reminders.log 2>&1",
          f"*/5 * * * * {kin_path} remind check --all-profiles "
          f">> {log_dir}/reminders.log 2>&1"),
     ]
@@ -963,25 +976,39 @@ def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
     # Check existing crontab
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = result.stdout if result.returncode == 0 else ""
+    lines = existing.splitlines()
 
-    missing = [line for markers, line in wanted
-               if not any(m in existing for m in markers)]
-    if not missing:
+    kept = [l for l in lines if not is_kindex_cron_line(l)]
+    ours = [l for l in lines if is_kindex_cron_line(l)]
+
+    final = []
+    changed = len(ours) != len(wanted)
+    for fingerprint, default_line in wanted:
+        match = next((l for l in ours if fingerprint in l), None)
+        if match is not None:
+            final.append(match)
+        else:
+            final.append(default_line)
+            changed = True
+
+    if not changed:
         actions.append("Crontab entries already exist")
         return actions
 
+    verb, dry_verb = ("Replaced", "replace") if ours else ("Added", "add")
     if not dry_run:
-        new_crontab = "\n".join([existing.rstrip(), *missing]).lstrip("\n") + "\n"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        new_crontab = "\n".join([*kept, *final]) + "\n"
         proc = subprocess.run(["crontab", "-"], input=new_crontab,
                               capture_output=True, text=True)
         if proc.returncode == 0:
-            for line in missing:
-                actions.append(f"Added crontab: {line}")
+            for line in final:
+                actions.append(f"{verb} crontab: {line}")
         else:
             actions.append(f"Failed to add crontab: {proc.stderr}")
     else:
-        for line in missing:
-            actions.append(f"Would add crontab: {line}")
+        for line in final:
+            actions.append(f"Would {dry_verb} crontab: {line}")
 
     return actions
 
@@ -1000,7 +1027,7 @@ def install_reminder_daemon(config: "Config", dry_run: bool = False) -> list[str
     kin_path = _find_kin_path()
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / "com.kindex.reminders.plist"
-    log_dir = config.data_path / "logs"
+    log_dir = config.scheduler_log_path
     interval = min(300, max(60, int(config.reminders.check_interval or 300)))
 
     plist_content = _launchd_plist(

@@ -5063,9 +5063,8 @@ def cmd_setup_cron(args):
                 lines = result.stdout.splitlines()
                 # Match only our installed shapes — a bare "remind check"
                 # marker could delete an unrelated user line.
-                filtered = [l for l in lines
-                            if "kin cron" not in l and "kindex" not in l
-                            and "remind check --all-profiles" not in l]
+                from .setup import is_kindex_cron_line
+                filtered = [l for l in lines if not is_kindex_cron_line(l)]
                 if len(filtered) < len(lines):
                     if not dry_run:
                         new_crontab = "\n".join(filtered) + "\n"
