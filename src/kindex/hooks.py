@@ -401,6 +401,10 @@ def capture_session_end(
 
     # Add extracted concepts
     for concept in extraction.get("concepts", []):
+        # Keyword fallback emits title-only concepts (useful for linking,
+        # not worth minting) — never create content-empty nodes here.
+        if not (concept.get("content") or "").strip():
+            continue
         if store.get_node_by_title(concept["title"]):
             continue
         nid = store.add_node(

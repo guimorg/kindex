@@ -448,12 +448,17 @@ def _extract_session_text(jsonl_path: Path, max_chars: int = 8000) -> str:
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-                # Extract text from assistant messages
+                # Extract text from assistant messages. Modern Claude Code
+                # transcripts nest the message: {"type": "assistant",
+                # "message": {"role": ..., "content": ...}}; older ones put
+                # role/content at the top level.
                 role = entry.get("role", "")
+                content = entry.get("content", "")
+                if not role and isinstance(entry.get("message"), dict):
+                    role = entry["message"].get("role", "")
+                    content = entry["message"].get("content", "")
                 if role != "assistant":
                     continue
-
-                content = entry.get("content", "")
                 if isinstance(content, str):
                     texts.append(content[:1000])
                     total_len += len(content[:1000])

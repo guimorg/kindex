@@ -1432,20 +1432,36 @@ def cmd_compact_hook(args):
             store.close()
             return
 
+    # A Claude Code hook pipes a JSON envelope ({session_id,
+    # transcript_path, ...}) on stdin — metadata, not conversation text.
+    env = {}
+    try:
+        from .attention import parse_hook_payload
+        env = parse_hook_payload(text) if text else {}
+    except Exception:
+        env = {}
+    tpath = env.get("transcript_path") or env.get("transcriptPath") or ""
+    is_envelope = bool(env.get("hook_event_name") or env.get("session_id") or tpath)
+
     # Silent, lightweight: if a hook envelope (PreCompact/Stop) gave us a
     # transcript path, queue the session for later reinforcement grading in cron.
     try:
-        from .attention import parse_hook_payload, resolve_conversation_id
+        from .attention import resolve_conversation_id
         from .reinforce import enqueue_reinforce
-        env = parse_hook_payload(text) if text else {}
-        tpath = env.get("transcript_path") or env.get("transcriptPath") or ""
         if tpath or env.get("session_id"):
             enqueue_reinforce(store, resolve_conversation_id(None, env),
                               transcript_path=tpath)
     except Exception:
         pass
 
-    if not text or len(text.strip()) < 10:
+    if is_envelope:
+        # Extracting from the envelope itself would mint one junk node per
+        # JSON field (issue #14). Substitute the real conversation text
+        # from the transcript file the envelope points at.
+        from .ingest import _extract_session_text
+        text = _extract_session_text(Path(tpath)) if tpath else ""
+
+    if not text or len(text.strip()) < 50:
         store.close()
         return
 
@@ -1456,6 +1472,10 @@ def cmd_compact_hook(args):
 
     count = 0
     for concept in extraction.get("concepts", []):
+        # Keyword fallback emits title-only concepts (useful for linking,
+        # not worth minting) — never create content-empty nodes here.
+        if not (concept.get("content") or "").strip():
+            continue
         if not store.get_node_by_title(concept["title"]):
             store.add_node(
                 title=concept["title"],
