@@ -181,9 +181,16 @@ _UNITY_LANGUAGE_BY_EXTENSION = {
     ".anim": "Unity Animation",
 }
 
-# Unity build/cache output that must never be indexed.
+# Unity build/cache output that must never be indexed. fnmatch's '*'
+# crosses path separators, so the '*/' variants catch nested Unity
+# projects (monorepo layouts) without matching e.g. Assets/MyLibrary/.
 _UNITY_EXCLUDES = [
-    "Library/*", "Temp/*", "Logs/*", "obj/*", "Build/*", "UserSettings/*",
+    "Library/*", "*/Library/*",
+    "Temp/*", "*/Temp/*",
+    "Logs/*", "*/Logs/*",
+    "obj/*", "*/obj/*",
+    "Build/*", "*/Build/*",
+    "UserSettings/*", "*/UserSettings/*",
 ]
 
 # GUID line in a .meta sidecar, e.g. "guid: 0123456789abcdef0123456789abcdef"
@@ -420,14 +427,23 @@ def _unity_guid(path: Path) -> str:
 
 
 def _count_lines(path: Path) -> int:
-    """Count source lines without requiring text decoding."""
+    """Count source lines without requiring text decoding.
+
+    Streams in chunks so huge files (e.g. multi-MB Unity scenes) never
+    get slurped into memory.
+    """
+    total = 0
+    last = b""
     try:
-        content = path.read_bytes()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                total += chunk.count(b"\n")
+                last = chunk
     except OSError:
         return 0
-    if not content:
+    if not last:
         return 0
-    return content.count(b"\n") + (not content.endswith(b"\n"))
+    return total + (not last.endswith(b"\n"))
 
 
 def _build_module_content(
@@ -1046,11 +1062,6 @@ def ingest_code(
 
     # Phase 1: Create module and symbol nodes from ctags
     for abs_path_str, file_tags in grouped.items():
-        if limit is not None and created + updated >= limit:
-            truncated = True
-            break
-        processed_files += 1
-
         abs_path = Path(abs_path_str)
         try:
             rel_path = str(abs_path.relative_to(effective_root))
@@ -1061,16 +1072,23 @@ def ingest_code(
         mod_id = _module_id(repo_slug, rel_path)
         module_node_ids[rel_path] = mod_id
 
-        # Check if file changed (incremental)
+        # Check if file changed (incremental). With unity, the GUID lives
+        # in a .meta sidecar outside the content hash, so a changed or
+        # newly-present GUID must also invalidate the skip.
         existing = store.get_node(mod_id)
         if existing:
-            old_hash = (existing.get("extra") or {}).get("file_hash", "")
+            old_extra = existing.get("extra") or {}
+            old_hash = old_extra.get("file_hash", "")
             try:
                 current_hash = _file_hash(abs_path)
             except OSError:
                 skipped += 1
                 continue
-            if old_hash == current_hash:
+            guid_unchanged = (
+                not unity
+                or old_extra.get("unity_guid", "") == _unity_guid(abs_path)
+            )
+            if old_hash == current_hash and guid_unchanged:
                 skipped += 1
                 # Still record symbol IDs for edge creation
                 for t in file_tags:
@@ -1081,6 +1099,14 @@ def ingest_code(
                         symbol_node_ids[qname] = sym_id
                         symbol_node_ids[t["name"]] = sym_id  # short name too
                 continue
+
+        # Only files that actually mint/update nodes consume the budget;
+        # checking here (after the unchanged-skip) avoids a false
+        # truncation warning when everything left would have been skipped.
+        if limit is not None and created + updated >= limit:
+            truncated = True
+            break
+        processed_files += 1
 
         try:
             current_hash = _file_hash(abs_path)
@@ -1157,13 +1183,15 @@ def ingest_code(
 
         # --- Symbol nodes (Tier 2) — classes/interfaces/types ---
         for t in file_tags:
-            if limit is not None and created + updated >= limit:
-                truncated = True
-                break
             if t.get("kind") not in _CLASS_KINDS:
                 continue
             if not _is_public(t):
                 continue
+            # Budget check after the filters, so tags that would never
+            # mint a node cannot trigger a false truncation warning.
+            if limit is not None and created + updated >= limit:
+                truncated = True
+                break
 
             scope = t.get("scope", "")
             qname = f"{rel_path}:{scope}.{t['name']}" if scope else f"{rel_path}:{t['name']}"
@@ -1516,6 +1544,35 @@ def ingest_code(
 
 # ── Adapter protocol wrapper ───────────────────────────────────────
 
+def _target_code_ingest(directory: str):
+    """Read the TARGET repo's own .kin/config code_ingest section.
+
+    The project-scoped Unity opt-in should follow the directory being
+    ingested, not whatever project the caller's cwd resolves to. Reads
+    only the target's git-tracked .kin/config (checked at the directory
+    itself, then at its git root) — no global config layering, so tests
+    and cross-project ingests stay hermetic. Returns None when absent.
+    """
+    try:
+        import yaml
+
+        from ..config import CodeIngestConfig
+
+        d = Path(directory).resolve()
+        repo = _detect_repo(d)
+        candidates = [d] + ([repo[0]] if repo else [])
+        for root in dict.fromkeys(candidates):
+            f = Path(root) / ".kin" / "config"
+            if f.is_file():
+                data = yaml.safe_load(f.read_text()) or {}
+                section = data.get("code_ingest") if isinstance(data, dict) else None
+                if isinstance(section, dict):
+                    return CodeIngestConfig(**section)
+    except Exception:
+        pass
+    return None
+
+
 class CodeAdapter:
     meta = AdapterMeta(
         name="code",
@@ -1542,9 +1599,11 @@ class CodeAdapter:
         if exclude_str:
             exclude = [p.strip() for p in exclude_str.split(",") if p.strip()]
 
-        # Unity opt-in: explicit --unity flag wins; otherwise the
-        # project's .kin/config code_ingest section decides.
-        code_ingest = getattr(kwargs.get("_config"), "code_ingest", None)
+        # Unity opt-in: explicit --unity flag wins; otherwise the TARGET
+        # directory's own .kin/config code_ingest section (the project
+        # being ingested, not the cwd), falling back to the loaded config.
+        code_ingest = (_target_code_ingest(directory)
+                       or getattr(kwargs.get("_config"), "code_ingest", None))
         unity = kwargs.get("unity")
         if unity is None:
             unity = bool(code_ingest and code_ingest.unity)

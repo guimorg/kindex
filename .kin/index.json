@@ -4,7 +4,7 @@
     "python",
     "shell"
   ],
-  "node_count": 122,
+  "node_count": 123,
   "nodes": [
     {
       "domains": [
@@ -26,7 +26,7 @@
       "title": "src/kindex/attention.py",
       "type": "artifact",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -37,7 +37,7 @@
       "title": "src/kindex/agent_adapters.py",
       "type": "artifact",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -48,7 +48,7 @@
       "title": "scripts/sync-version.sh",
       "type": "artifact",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -81,7 +81,7 @@
       "title": "src/kindex/kin_merge.py",
       "type": "artifact",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -91,7 +91,7 @@
       "id": "code-mod-kindex-1668da8a23a5",
       "title": "src/kindex/daemon.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -124,7 +124,7 @@
       "id": "code-mod-kindex-1a589d0d4ff2",
       "title": "src/kindex/adapters/pipeline.py",
       "type": "artifact",
-      "updated_at": "2026-03-16T16:20:26",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -135,7 +135,7 @@
       "id": "code-mod-kindex-1b467bb9761a",
       "title": "src/kindex/reminders.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -146,7 +146,7 @@
       "id": "code-mod-kindex-1cc1824729d5",
       "title": "src/kindex/ingest.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -157,7 +157,7 @@
       "id": "code-mod-kindex-1fd61a2a944a",
       "title": "src/kindex/actions.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -168,7 +168,7 @@
       "id": "code-mod-kindex-21dd45af3575",
       "title": "src/kindex/scheduling.py",
       "type": "artifact",
-      "updated_at": "2026-03-16T16:20:26",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -190,7 +190,7 @@
       "id": "code-mod-kindex-2ecdcb3c4276",
       "title": "src/kindex/adapters/github.py",
       "type": "artifact",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -202,7 +202,7 @@
       "title": "src/kindex/sim.py",
       "type": "artifact",
       "updated_at": "2026-06-11T15:16:38",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -234,7 +234,7 @@
       "id": "code-mod-kindex-4af5ee17841c",
       "title": "src/kindex/adapters/linear.py",
       "type": "artifact",
-      "updated_at": "2026-03-16T16:20:26",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -246,7 +246,7 @@
       "title": "src/kindex/reinforce.py",
       "type": "artifact",
       "updated_at": "2026-06-11T15:16:38",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -257,7 +257,7 @@
       "title": "src/kindex/agent_settings.py",
       "type": "artifact",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -278,7 +278,7 @@
       "id": "code-mod-kindex-62731532a556",
       "title": "src/kindex/setup.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -289,7 +289,7 @@
       "id": "code-mod-kindex-66df7720eed6",
       "title": "src/kindex/cli.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -300,7 +300,7 @@
       "id": "code-mod-kindex-6a3142a46050",
       "title": "src/kindex/config.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -311,7 +311,7 @@
       "id": "code-mod-kindex-6a374a6f7fce",
       "title": "src/kindex/vectors.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -334,7 +334,7 @@
       "title": "src/kindex/routing.py",
       "type": "artifact",
       "updated_at": "2026-06-12T11:32:26",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -355,7 +355,7 @@
       "id": "code-mod-kindex-7ccf79c98767",
       "title": "src/kindex/adapters/base.py",
       "type": "artifact",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -455,7 +455,7 @@
       "title": "src/kindex/coordination.py",
       "type": "artifact",
       "updated_at": "2026-06-12T11:32:26",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -466,7 +466,7 @@
       "title": "src/kindex/adapters/codex_sessions.py",
       "type": "artifact",
       "updated_at": "2026-05-24T14:04:23",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -487,7 +487,7 @@
       "id": "code-mod-kindex-bd222a4e378f",
       "title": "src/kindex/hooks.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -499,7 +499,7 @@
       "title": "src/kindex/adapters/understand_anything.py",
       "type": "artifact",
       "updated_at": "2026-05-24T14:04:23",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -509,7 +509,7 @@
       "id": "code-mod-kindex-c36798e40719",
       "title": "src/kindex/adapters/code.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0109
     },
     {
@@ -520,7 +520,7 @@
       "id": "code-mod-kindex-c4522229e518",
       "title": "src/kindex/__init__.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T20:15:17",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -554,7 +554,7 @@
       "title": "src/kindex/scoping.py",
       "type": "artifact",
       "updated_at": "2026-06-11T15:16:38",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -597,8 +597,8 @@
       "id": "code-mod-kindex-e381cc44d87c",
       "title": "src/kindex/code_map.py",
       "type": "artifact",
-      "updated_at": "2026-06-12T11:39:40",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -609,7 +609,7 @@
       "title": "src/kindex/locks.py",
       "type": "artifact",
       "updated_at": "2026-06-11T15:16:38",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -619,7 +619,7 @@
       "id": "code-mod-kindex-f9986c492ab2",
       "title": "src/kindex/mcp_server.py",
       "type": "artifact",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -652,8 +652,8 @@
       "id": "code-sym-kindex-05a1fbf0db2e",
       "title": "AgentsConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -663,8 +663,8 @@
       "id": "code-sym-kindex-0850aa56538b",
       "title": "ProfileEntry",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -674,7 +674,7 @@
       "id": "code-sym-kindex-08e1ea9d3cda",
       "title": "ReminderConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -696,7 +696,7 @@
       "id": "code-sym-kindex-0c0e017eda89",
       "title": "GitHubAdapter",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0108
     },
     {
@@ -740,8 +740,8 @@
       "id": "code-sym-kindex-15261553fafb",
       "title": "SimConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -773,7 +773,7 @@
       "id": "code-sym-kindex-1980fbc0bfbc",
       "title": "AdapterOption",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0108
     },
     {
@@ -785,7 +785,7 @@
       "title": "AttentionInjection",
       "type": "concept",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -795,7 +795,7 @@
       "id": "code-sym-kindex-1f90559c7f69",
       "title": "AdapterMeta",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0108
     },
     {
@@ -806,8 +806,8 @@
       "id": "code-sym-kindex-200aad86be36",
       "title": "AttentionConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -817,8 +817,8 @@
       "id": "code-sym-kindex-279e1c45cb06",
       "title": "AgentInstanceConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -850,8 +850,8 @@
       "id": "code-sym-kindex-352d8c9bbdba",
       "title": "CollabConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -861,7 +861,7 @@
       "id": "code-sym-kindex-36fe0270bb97",
       "title": "ScheduleTier",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -872,8 +872,8 @@
       "id": "code-sym-kindex-415d46d7c508",
       "title": "RankingConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -884,7 +884,7 @@
       "title": "AttentionCandidate",
       "type": "concept",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -895,7 +895,7 @@
       "title": "Edge",
       "type": "concept",
       "updated_at": "2026-03-16T16:20:11",
-      "weight": 0.0183
+      "weight": 0.0169
     },
     {
       "domains": [
@@ -916,8 +916,8 @@
       "id": "code-sym-kindex-552c22e16187",
       "title": "WorkPolicyConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -927,7 +927,7 @@
       "id": "code-sym-kindex-58d630bc994a",
       "title": "ClaudeChannelConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -938,7 +938,7 @@
       "id": "code-sym-kindex-608ef82e510c",
       "title": "Config",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -949,7 +949,7 @@
       "id": "code-sym-kindex-62490d9465aa",
       "title": "TelegramChannelConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -960,7 +960,7 @@
       "id": "code-sym-kindex-6d1dbf76937d",
       "title": "BudgetConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.01
     },
     {
@@ -982,7 +982,7 @@
       "id": "code-sym-kindex-74266f41225f",
       "title": "SystemChannelConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -994,7 +994,7 @@
       "title": "CodexSessionsAdapter",
       "type": "concept",
       "updated_at": "2026-05-24T14:04:22",
-      "weight": 0.5
+      "weight": 0.359
     },
     {
       "domains": [
@@ -1015,7 +1015,7 @@
       "id": "code-sym-kindex-7c4b42dbb2fa",
       "title": "LLMConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.01
     },
     {
@@ -1026,7 +1026,7 @@
       "id": "code-sym-kindex-7e4d614285e9",
       "title": "SlackChannelConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -1037,7 +1037,7 @@
       "id": "code-sym-kindex-89cc5b13c9e0",
       "title": "EmailChannelConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -1070,8 +1070,8 @@
       "id": "code-sym-kindex-979d447616b7",
       "title": "AgentOverrideConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1082,7 +1082,7 @@
       "title": "ReinforceOutcome",
       "type": "concept",
       "updated_at": "2026-06-11T15:16:37",
-      "weight": 0.5
+      "weight": 0.4124
     },
     {
       "domains": [
@@ -1093,7 +1093,7 @@
       "title": "EditPolicyError",
       "type": "concept",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1114,8 +1114,8 @@
       "id": "code-sym-kindex-a8ad139fc733",
       "title": "LinearPolicyConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1125,7 +1125,7 @@
       "id": "code-sym-kindex-aa2ebf2ad1ea",
       "title": "Adapter",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -1137,7 +1137,7 @@
       "title": "LockHeldError",
       "type": "concept",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1159,7 +1159,7 @@
       "title": "UnderstandAnythingAdapter",
       "type": "concept",
       "updated_at": "2026-05-24T14:04:22",
-      "weight": 0.5
+      "weight": 0.359
     },
     {
       "domains": [
@@ -1169,7 +1169,7 @@
       "id": "code-sym-kindex-b42e459fa446",
       "title": "DefaultsConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     },
     {
@@ -1203,7 +1203,7 @@
       "title": "ProfileMismatchError",
       "type": "concept",
       "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1213,8 +1213,19 @@
       "id": "code-sym-kindex-b90676bdf42f",
       "title": "EmbeddingConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
+    },
+    {
+      "domains": [
+        "code",
+        "python"
+      ],
+      "id": "code-sym-kindex-c30edae67b27",
+      "title": "CodeIngestConfig",
+      "type": "concept",
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.5
     },
     {
       "domains": [
@@ -1224,8 +1235,8 @@
       "id": "code-sym-kindex-c644dbd33873",
       "title": "GitPolicyConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
-      "weight": 0.5
+      "updated_at": "2026-07-15T21:37:31",
+      "weight": 0.4811
     },
     {
       "domains": [
@@ -1246,7 +1257,7 @@
       "id": "code-sym-kindex-c6a95ef8e147",
       "title": "IngestResult",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:11",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0108
     },
     {
@@ -1279,7 +1290,7 @@
       "id": "code-sym-kindex-cdda024a8c00",
       "title": "IngestConfig",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:26",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0108
     },
     {
@@ -1290,7 +1301,7 @@
       "id": "code-sym-kindex-d9d978ada693",
       "title": "LinearAdapter",
       "type": "concept",
-      "updated_at": "2026-03-16T16:20:26",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0108
     },
     {
@@ -1312,7 +1323,7 @@
       "id": "code-sym-kindex-e3d3571dcdc7",
       "title": "CodeAdapter",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T23:28:47",
       "weight": 0.0108
     },
     {
@@ -1345,7 +1356,7 @@
       "id": "code-sym-kindex-fe4d5554b184",
       "title": "ChannelsConfig",
       "type": "concept",
-      "updated_at": "2026-07-01T19:37:21",
+      "updated_at": "2026-07-15T21:37:31",
       "weight": 0.0109
     }
   ],

@@ -148,6 +148,29 @@ def test_title_only_keyword_concepts_are_not_minted(tmp_path):
     assert _nodes(tmp_path) == {}
 
 
+def test_short_plain_text_keeps_original_floor(tmp_path):
+    # 33 chars — below the 50-char envelope floor, above the plain-text 10
+    r = _run_hook(tmp_path, "learned that X caches auth tokens")
+    assert r.returncode == 0, r.stderr
+    assert any("caches auth tokens" in title for title in _nodes(tmp_path))
+
+
+def test_transcript_with_non_object_json_lines_does_not_crash(tmp_path):
+    from kindex.ingest import _extract_session_text
+
+    transcript = tmp_path / "mixed.jsonl"
+    transcript.write_text(
+        "null\n42\n[1, 2]\n\"str\"\n"
+        + json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant",
+                        "content": [{"type": "text", "text": "Real insight."},
+                                    {"type": "text", "text": None}]},
+        }) + "\n"
+    )
+    assert "Real insight." in _extract_session_text(transcript)
+
+
 def test_extract_session_text_handles_nested_message_format(tmp_path):
     from kindex.ingest import _extract_session_text
 

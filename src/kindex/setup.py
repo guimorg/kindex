@@ -936,14 +936,21 @@ def uninstall_launchd(dry_run: bool = False) -> list[str]:
 
 
 def is_kindex_cron_line(line: str) -> bool:
-    """Shape-match every historical kindex crontab line.
+    """Shape-match every historical kindex crontab job line.
 
     Shared by install (migration), uninstall, and the adaptive repack so
-    the matchers never diverge. Matches the `python -m kindex.cli`
-    fallback shape too (no "kin cron" substring, but "kindex" appears).
+    the matchers never diverge. Matches command shapes only — never
+    comments or user lines that merely mention a kindex path (e.g. a
+    backup job touching ~/.kindex must not be classified as ours).
+    Covers the binary form ("kin cron"), the `python -m kindex.cli`
+    fallback ("kindex.cli cron"), and the reminder job.
     """
-    return ("kin cron" in line or "kindex" in line
-            or "remind check --all-profiles" in line)
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
+        return False
+    return ("kin cron" in stripped or "kindex.cli cron" in stripped
+            or "kindex cron" in stripped
+            or "remind check --all-profiles" in stripped)
 
 
 def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
@@ -979,25 +986,37 @@ def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
     lines = existing.splitlines()
 
     kept = [l for l in lines if not is_kindex_cron_line(l)]
-    ours = [l for l in lines if is_kindex_cron_line(l)]
+    pool = [l for l in lines if is_kindex_cron_line(l)]
+    had_ours = bool(pool)
 
     final = []
-    changed = len(ours) != len(wanted)
+    changed = False
     for fingerprint, default_line in wanted:
-        match = next((l for l in ours if fingerprint in l), None)
+        match = next((l for l in pool if fingerprint in l), None)
         if match is not None:
+            # Current command + log target: keep as-is (preserves an
+            # adaptively repacked schedule).
+            pool.remove(match)
             final.append(match)
         else:
             final.append(default_line)
             changed = True
+    if pool:
+        # Leftover kindex job lines are stale (old log path) or dupes —
+        # dropping them is the migration.
+        changed = True
 
     if not changed:
         actions.append("Crontab entries already exist")
         return actions
 
-    verb, dry_verb = ("Replaced", "replace") if ours else ("Added", "add")
+    verb, dry_verb = ("Replaced", "replace") if had_ours else ("Added", "add")
     if not dry_run:
-        log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            actions.append(f"Failed to create log dir {log_dir}: {e}")
+            return actions
         new_crontab = "\n".join([*kept, *final]) + "\n"
         proc = subprocess.run(["crontab", "-"], input=new_crontab,
                               capture_output=True, text=True)

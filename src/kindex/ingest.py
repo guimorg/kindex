@@ -447,6 +447,8 @@ def _extract_session_text(jsonl_path: Path, max_chars: int = 8000) -> str:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
+                if not isinstance(entry, dict):
+                    continue
 
                 # Extract text from assistant messages. Modern Claude Code
                 # transcripts nest the message: {"type": "assistant",
@@ -464,8 +466,9 @@ def _extract_session_text(jsonl_path: Path, max_chars: int = 8000) -> str:
                     total_len += len(content[:1000])
                 elif isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")[:1000]
+                        if (isinstance(block, dict) and block.get("type") == "text"
+                                and isinstance(block.get("text"), str)):
+                            text = block["text"][:1000]
                             texts.append(text)
                             total_len += len(text)
     except OSError:

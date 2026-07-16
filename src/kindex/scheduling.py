@@ -145,6 +145,11 @@ def _apply_crontab(interval: int, config: "Config") -> dict:
         # target must not drift to whichever profile's pass last changed
         # the interval (issue #15).
         log_dir = config.scheduler_log_path
+        try:
+            # A '>>' redirect into a missing dir kills the job silently.
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # best-effort: never let a log-dir failure break the repack
         # Convert interval to cron minutes (minimum 1)
         minutes = max(1, interval // 60)
         new_lines.append(f"*/{minutes} * * * * {kin_path} cron >> {log_dir}/cron.log 2>&1")

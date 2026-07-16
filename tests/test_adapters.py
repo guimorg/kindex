@@ -550,6 +550,32 @@ class TestIngestResult:
         assert "WARNING: limit 2 reached" in s
 
 
+class TestUnlimitedLimitAtApiBoundaries:
+    def test_linear_first_clamped_to_api_max(self, store, monkeypatch):
+        from kindex.adapters import linear as klinear
+
+        captured = {}
+
+        def fake_query(query, variables):
+            captured.update(variables)
+            return {"data": {"issues": {"nodes": []}}}
+
+        monkeypatch.setattr(klinear, "_linear_query", fake_query)
+        klinear.ingest_issues(store, limit=sys.maxsize)
+        assert captured["first"] == 250
+
+    def test_github_commits_per_page_clamped(self, store):
+        from kindex.adapters.github import ingest_commits
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "[]"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            ingest_commits(store, "o/r", limit=sys.maxsize)
+        cmd = mock_run.call_args[0][0]
+        assert "per_page=100" in cmd[-1]
+
+
 class TestAdapterProtocol:
     def test_stub_is_adapter(self):
         assert isinstance(_StubAdapter(), Adapter)

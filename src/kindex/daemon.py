@@ -280,6 +280,10 @@ def remind_check_all(base_config: "Config", verbose: bool = False) -> list[dict]
         for name, entry in profiles.items():
             cfg = base_config.model_copy(deep=True)
             cfg.data_dir = str(Path(entry.data_dir).expanduser())
+            # Anchor scheduler logs to the base dir (see cron_run_all).
+            cfg._legacy_data_dir = (
+                getattr(base_config, "_legacy_data_dir", None) or base_config.data_dir
+            )
             cfg.active_profile = name
             cfg.profile_source = "cron"
             results.append(_one(cfg, name))
@@ -298,6 +302,10 @@ def remind_check_all(base_config: "Config", verbose: bool = False) -> list[dict]
             continue  # project deleted since registration — ages out on scan
         cfg = base_config.model_copy(deep=True)
         cfg.data_dir = data_dir
+        # Anchor scheduler logs to the base dir (see cron_run_all).
+        cfg._legacy_data_dir = (
+            getattr(base_config, "_legacy_data_dir", None) or base_config.data_dir
+        )
         cfg.active_profile = None
         cfg.profile_source = "project"
         if str(cfg.data_path) in swept_dirs:
@@ -367,6 +375,12 @@ def cron_run_all(base_config: "Config", verbose: bool = False) -> list[dict]:
     for name, entry in profiles.items():
         cfg = base_config.model_copy(deep=True)
         cfg.data_dir = str(Path(entry.data_dir).expanduser())
+        # Keep scheduler logs anchored to the base dir: this pass's config
+        # reaches the adaptive repack (scheduling._apply_crontab), and the
+        # crontab log target must not drift to a profile dir (issue #15).
+        cfg._legacy_data_dir = (
+            getattr(base_config, "_legacy_data_dir", None) or base_config.data_dir
+        )
         cfg.active_profile = name
         cfg.profile_source = "cron"
         cfg._session_filter = profile_session_filter(profiles, name, default_name)

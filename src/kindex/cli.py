@@ -1461,7 +1461,11 @@ def cmd_compact_hook(args):
         from .ingest import _extract_session_text
         text = _extract_session_text(Path(tpath)) if tpath else ""
 
-    if not text or len(text.strip()) < 50:
+    # Envelope-derived transcripts get a higher floor (real conversations
+    # are long; short residue means extraction failed). Plain piped text
+    # keeps the original threshold so short direct captures still work.
+    min_len = 50 if is_envelope else 10
+    if not text or len(text.strip()) < min_len:
         store.close()
         return
 

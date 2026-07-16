@@ -70,6 +70,22 @@ def test_ingest_code_limit_truncates_with_warning(tmp_path, local_only, store):
     assert "WARNING: limit 2" in str(result)
 
 
+def test_ingest_code_exact_limit_no_false_warning(tmp_path, local_only, store):
+    repo = _make_repo(tmp_path, 5)
+    result = code.ingest_code(store, repo, limit=5)
+    assert result.created == 5
+    assert result.warnings == []
+
+
+def test_reingest_unchanged_under_limit_no_false_warning(tmp_path, local_only, store):
+    repo = _make_repo(tmp_path, 5)
+    code.ingest_code(store, repo)
+    result = code.ingest_code(store, repo, limit=1)
+    assert result.created == 0
+    assert result.skipped == 5
+    assert result.warnings == []
+
+
 class _LimitRecordingAdapter:
     meta = AdapterMeta(name="limit-recorder", description="Records limit kwarg")
 

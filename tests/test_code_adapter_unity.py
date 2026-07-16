@@ -127,6 +127,50 @@ def test_adapter_reads_code_ingest_config(tmp_path, local_only, store):
     assert "Assets/Player.prefab" in _modules(store)
 
 
+def test_unity_excludes_nested_library_but_not_asset_folders(tmp_path, local_only, store):
+    repo = tmp_path / "repo"
+    (repo / "Games" / "ProjA" / "Library").mkdir(parents=True)
+    (repo / "Games" / "ProjA" / "Assets").mkdir()
+    (repo / "Assets" / "MyLibrary").mkdir(parents=True)
+    (repo / "Games" / "ProjA" / "Library" / "x.asset").write_text(_UNITY_YAML)
+    (repo / "Games" / "ProjA" / "Assets" / "keep.asset").write_text(_UNITY_YAML)
+    (repo / "Assets" / "MyLibrary" / "thing.asset").write_text(_UNITY_YAML)
+
+    result = code.ingest_code(store, repo, unity=True)
+    assert result.errors == []
+    assert set(_modules(store)) == {
+        "Games/ProjA/Assets/keep.asset",
+        "Assets/MyLibrary/thing.asset",
+    }
+
+
+def test_target_directory_kin_config_enables_unity(tmp_path, local_only, store):
+    repo = _make_unity_repo(tmp_path)
+    kin_dir = repo / ".kin"
+    kin_dir.mkdir()
+    (kin_dir / "config").write_text("code_ingest:\n  unity: true\n")
+
+    result = code.adapter.ingest(store, directory=str(repo))
+    assert result.errors == []
+    assert "Assets/Player.prefab" in _modules(store)
+
+
+def test_unity_guid_refresh_on_unchanged_asset(tmp_path, local_only, store):
+    repo = _make_unity_repo(tmp_path)
+    first = code.ingest_code(store, repo, unity=True)
+    assert first.errors == []
+
+    new_guid = "ffffffffffffffffffffffffffffffff"
+    (repo / "Assets" / "Player.prefab.meta").write_text(
+        f"fileFormatVersion: 2\nguid: {new_guid}\n"
+    )
+
+    second = code.ingest_code(store, repo, unity=True)
+    assert second.errors == []
+    prefab = _modules(store)["Assets/Player.prefab"]["extra"]
+    assert prefab["unity_guid"] == new_guid
+
+
 def test_adapter_flag_overrides_config_off(tmp_path, local_only, store):
     repo = _make_unity_repo(tmp_path)
     cfg = Config(
