@@ -43,6 +43,9 @@ def _linear_query(query: str, variables: dict | None = None) -> dict | None:
 def ingest_issues(store: "Store", team: str | None = None,
                   limit: int = 50, verbose: bool = False) -> int:
     """Ingest Linear issues as knowledge nodes."""
+    # Linear's GraphQL API caps page size at 250 and errors on larger
+    # `first` values (an "unlimited" limit would otherwise break the call).
+    limit = min(limit, 250)
 
     query = """
     query($first: Int, $filter: IssueFilter) {

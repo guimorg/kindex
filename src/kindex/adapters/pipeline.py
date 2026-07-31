@@ -19,10 +19,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class IngestConfig:
-    """Shared ingestion constraints applied to all adapters."""
+    """Shared ingestion constraints applied to all adapters.
+
+    limit semantics: None = not specified (each adapter's own default
+    governs); 0 or negative = unlimited; positive = hard cap.
+    """
 
     since: str | None = None
-    limit: int = 50
+    limit: int | None = None
     dry_run: bool = False
     verbose: bool = False
     domain_overrides: list[str] | None = None
@@ -72,13 +76,15 @@ def run_adapter(
 
     # Run the adapter
     try:
-        result = adapter.ingest(
-            store,
-            limit=config.limit,
+        ingest_kwargs: dict[str, Any] = dict(
             since=config.since,
             verbose=config.verbose,
             **kwargs,
         )
+        if config.limit is not None:
+            # 0 (or negative) means unlimited; adapters always receive an int.
+            ingest_kwargs["limit"] = config.limit if config.limit > 0 else sys.maxsize
+        result = adapter.ingest(store, **ingest_kwargs)
     except Exception as e:
         msg = f"{name}: {type(e).__name__}: {e}"
         if config.verbose:

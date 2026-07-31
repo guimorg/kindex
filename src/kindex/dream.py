@@ -29,14 +29,27 @@ if TYPE_CHECKING:
     from .config import Config
     from .store import Store
 
+from .schema import EDIT_POLICY
+
 logger = logging.getLogger(__name__)
 
-# Node types that dream must never touch (CD008)
-PROTECTED_TYPES = frozenset({"constraint", "directive", "checkpoint"})
+# Node types that dream must never touch (CD008). Derived from the schema
+# edit policy as the single source of truth: additive types (history matters
+# — a merge rewrites content the edit policy forbids) plus managed types
+# (task/session/coordination — subsystem-owned state lives in extra and a
+# merge would destroy members/cursors/messages/locks).
+PROTECTED_TYPES = (frozenset(EDIT_POLICY["additive"])
+                   | frozenset(EDIT_POLICY["managed"]))
 
 # Similarity thresholds (CD002)
 DEFAULT_MERGE_THRESHOLD = 0.95
 DEFAULT_SUGGEST_THRESHOLD = 0.85
+DEFAULT_MAX_NEW_SUGGESTIONS = 100
+
+LAST_DREAM_STARTED_META = "last_dream_started"
+LAST_DREAM_RUN_META = "last_dream_run"
+LAST_DREAM_MODE_META = "last_dream_mode"
+DEFAULT_DREAM_MIN_INTERVAL = 3600
 
 
 # ── Locking ───────────────────────────────────────────────────────────
@@ -65,6 +78,71 @@ def _release_lock(fd: int, config: Config) -> None:
         os.close(fd)
     except OSError:
         pass
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now()
+
+
+def _parse_timestamp(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _dream_min_interval(config: Config) -> int:
+    return max(
+        0,
+        int(getattr(config.reminders, "dream_min_interval", DEFAULT_DREAM_MIN_INTERVAL) or 0),
+    )
+
+
+def dream_due(
+    store: Store,
+    *,
+    min_interval_seconds: int,
+    now: datetime.datetime | None = None,
+) -> dict:
+    """Return whether scheduled dream work should run now.
+
+    Uses the last start marker, not only the successful completion marker, so a
+    killed or long-running detached dream cannot be immediately respawned by the
+    next hook event.
+    """
+    if min_interval_seconds <= 0:
+        return {"due": True}
+
+    now = now or _now()
+    last_value = (
+        store.get_meta(LAST_DREAM_STARTED_META)
+        or store.get_meta(LAST_DREAM_RUN_META)
+    )
+    last = _parse_timestamp(last_value)
+    if last is None:
+        return {"due": True}
+
+    elapsed = (now - last).total_seconds()
+    if elapsed >= min_interval_seconds:
+        return {"due": True, "last_started": last_value, "elapsed_seconds": int(elapsed)}
+
+    next_allowed = last + datetime.timedelta(seconds=min_interval_seconds)
+    return {
+        "due": False,
+        "skipped": "recent",
+        "last_started": last_value,
+        "next_allowed": next_allowed.isoformat(timespec="seconds"),
+        "remaining_seconds": int(min_interval_seconds - elapsed),
+    }
+
+
+def mark_dream_started(store: Store, mode: str, *, when: datetime.datetime | None = None) -> str:
+    timestamp = (when or _now()).isoformat(timespec="seconds")
+    store.set_meta(LAST_DREAM_STARTED_META, timestamp)
+    store.set_meta(LAST_DREAM_MODE_META, mode)
+    return timestamp
 
 
 # ── Similarity ────────────────────────────────────────────────────────
@@ -112,6 +190,7 @@ def find_duplicates(
     merge_pairs: list[tuple[str, str, float]] = []
     suggest_pairs: list[tuple[str, str, float]] = []
     seen: set[tuple[str, str]] = set()
+    min_title_for_suggest = max(0.0, (suggest_threshold - 0.3) / 0.7)
 
     # Group by first 4 chars of lowercase title for O(n*k) instead of O(n^2)
     # Cap bucket size at 50 to bound worst-case pairwise comparisons
@@ -135,7 +214,11 @@ def find_duplicates(
                     continue
                 seen.add(pair_key)
 
-                score = combined_similarity(a, b)
+                t_sim = title_similarity(a.get("title", ""), b.get("title", ""))
+                if t_sim < min_title_for_suggest:
+                    continue
+                c_sim = content_overlap(a.get("content", ""), b.get("content", ""))
+                score = 0.7 * t_sim + 0.3 * c_sim
                 if score >= merge_threshold:
                     merge_pairs.append((a["id"], b["id"], score))
                 elif score >= suggest_threshold:
@@ -152,6 +235,11 @@ def merge_nodes(store: Store, source_id: str, target_id: str) -> bool:
     source = store.get_node(source_id)
     target = store.get_node(target_id)
     if not source or not target:
+        return False
+    # Defense in depth: never merge protected types even if a caller bypasses
+    # find_duplicates' filter — subsystem-owned/history-bearing nodes survive.
+    if (source.get("type", "concept") in PROTECTED_TYPES
+            or target.get("type", "concept") in PROTECTED_TYPES):
         return False
 
     # Move edges from source to target
@@ -184,10 +272,13 @@ def merge_nodes(store: Store, source_id: str, target_id: str) -> bool:
     tw = target.get("weight", 0.5) or 0.5
     store.update_node(target_id, weight=min(1.0, max(tw, sw)))
 
-    # Archive source (CD001: never delete, only archive)
+    # Archive source (CD001: never delete, only archive). Preserve the
+    # existing extra (locks, claims, expiry, ...) — only annotate the merge.
+    merged_extra = dict(source.get("extra") or {})
+    merged_extra.update({"merged_into": target_id, "merged_by": "dream-cycle"})
     store.update_node(
         source_id, status="archived", weight=0.01,
-        extra={"merged_into": target_id, "merged_by": "dream-cycle"},
+        extra=merged_extra,
     )
     return True
 
@@ -334,25 +425,39 @@ def dream_lightweight(
             if verbose:
                 print(f"  Merged: {source_id} -> {target_id} (score={score:.3f})")
 
-    # Create suggestions for near-misses
+    # Create suggestions for near-misses. This path runs from hooks, so keep
+    # writes bounded even if the graph has a large duplicate backlog.
+    max_new_suggestions = max(
+        0,
+        int(
+            getattr(
+                config.reminders,
+                "dream_max_new_suggestions",
+                DEFAULT_MAX_NEW_SUGGESTIONS,
+            )
+            or 0
+        ),
+    )
     suggested = 0
+    existing_suggestions = 0
+    suggestion_candidates = len(dupes["suggest"])
+    suggestion_capped = False
     for a_id, b_id, score in dupes["suggest"]:
         if dry_run:
             suggested += 1
             continue
-        # Deduplicate against existing suggestions
-        existing = store.pending_suggestions(limit=200)
-        already = any(
-            (e["concept_a"] in (a_id, b_id) and e["concept_b"] in (a_id, b_id))
-            for e in existing
+        if suggested >= max_new_suggestions:
+            suggestion_capped = True
+            break
+        if store.suggestion_exists(a_id, b_id):
+            existing_suggestions += 1
+            continue
+        store.add_suggestion(
+            concept_a=a_id, concept_b=b_id,
+            reason=f"Fuzzy match (score={score:.3f})",
+            source="dream-cycle",
         )
-        if not already:
-            store.add_suggestion(
-                concept_a=a_id, concept_b=b_id,
-                reason=f"Fuzzy match (score={score:.3f})",
-                source="dream-cycle",
-            )
-            suggested += 1
+        suggested += 1
 
     # Auto-apply pending suggestions
     applied = 0
@@ -361,6 +466,10 @@ def dream_lightweight(
 
     results["merged"] = merged
     results["suggested"] = suggested
+    results["suggestion_candidates"] = suggestion_candidates
+    results["suggestion_existing"] = existing_suggestions
+    results["suggestion_cap"] = max_new_suggestions
+    results["suggestion_capped"] = suggestion_capped
     results["suggestions_applied"] = applied
 
     return results
@@ -413,6 +522,11 @@ def dream_cycle(
         return {"skipped": "locked"}
 
     try:
+        if dry_run:
+            started = _now().isoformat(timespec="seconds")
+        else:
+            started = mark_dream_started(store, mode)
+
         if mode == "lightweight":
             results = dream_lightweight(config, store, verbose=verbose, dry_run=dry_run)
         elif mode == "deep":
@@ -422,24 +536,46 @@ def dream_cycle(
             results = dream_full(config, store, verbose=verbose, dry_run=dry_run)
 
         results["mode"] = mode
-        results["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+        results["started_at"] = started
+        results["timestamp"] = _now().isoformat(timespec="seconds")
 
         # Store last dream marker
         if not dry_run:
-            store.set_meta("last_dream_run", results["timestamp"])
-            store.set_meta("last_dream_mode", mode)
+            store.set_meta(LAST_DREAM_RUN_META, results["timestamp"])
+            store.set_meta(LAST_DREAM_MODE_META, mode)
 
         return results
     finally:
         _release_lock(fd, config)
 
 
-def detach_dream(config: Config, mode: str = "lightweight") -> int:
-    """Spawn a detached dream subprocess. Returns child PID.
+def detach_dream(config: Config, mode: str = "lightweight", *, force: bool = False) -> dict:
+    """Spawn a detached dream subprocess if the scheduled cadence allows it.
 
     Uses start_new_session=True so the child survives parent exit (CD005).
     """
+    from .store import Store
     from .setup import _find_kin_path
+
+    min_interval = _dream_min_interval(config)
+    fd = _acquire_lock(config)
+    if fd is None:
+        return {"detached": False, "skipped": "locked", "mode": mode}
+
+    store = Store(config)
+    try:
+        decision = dream_due(store, min_interval_seconds=min_interval)
+        if not force and not decision.get("due", False):
+            return {
+                "detached": False,
+                "mode": mode,
+                "min_interval_seconds": min_interval,
+                **decision,
+            }
+        started = mark_dream_started(store, mode)
+    finally:
+        store.close()
+        _release_lock(fd, config)
 
     kin_path = _find_kin_path()
     log_dir = config.data_path / "logs"
@@ -457,4 +593,10 @@ def detach_dream(config: Config, mode: str = "lightweight") -> int:
             stdin=subprocess.DEVNULL,
         )
 
-    return proc.pid
+    return {
+        "detached": True,
+        "pid": proc.pid,
+        "mode": mode,
+        "started_at": started,
+        "min_interval_seconds": min_interval,
+    }

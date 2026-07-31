@@ -6,12 +6,15 @@ import datetime
 import re
 from typing import TYPE_CHECKING
 
+from .scoping import item_matches_conversation
+
 if TYPE_CHECKING:
     from .config import Config
     from .store import Store
 
 
 _VALID_PRIORITIES = ("low", "normal", "high", "urgent")
+_VALID_WAKE_CLIENTS = ("codex", "opencode")
 
 
 def _try_repack(store: "Store") -> None:
@@ -272,21 +275,67 @@ def create_reminder(
     action_command: str = "",
     action_instructions: str = "",
     action_mode: str = "auto",
+    wake_client: str = "",
+    wake_session_id: str = "",
+    wake_cwd: str = "",
+    wake_model: str = "",
+    wake_agent: str = "",
+    attention_triggers: list[str] | None = None,
+    conversation_id: str = "",
+    scope: str = "",
 ) -> str:
     """Create a new reminder. Returns the reminder ID."""
     if priority not in _VALID_PRIORITIES:
         raise ValueError(f"Invalid priority {priority!r}; must be one of {_VALID_PRIORITIES}")
+    scope = scope.strip().lower()
+    if scope and scope not in {"chat", "global"}:
+        raise ValueError("Invalid reminder scope; must be 'chat' or 'global'")
+    wake_client = wake_client.strip().lower()
+    if wake_client and wake_client not in _VALID_WAKE_CLIENTS:
+        raise ValueError(
+            f"Invalid wake client {wake_client!r}; must be one of {_VALID_WAKE_CLIENTS}"
+        )
+    if wake_client:
+        if action_mode not in ("auto", wake_client):
+            raise ValueError(
+                f"Wake client {wake_client!r} requires action_mode 'auto' or {wake_client!r}"
+            )
+        action_mode = wake_client
 
     next_due, schedule, reminder_type = parse_time_spec(time_spec)
 
     extra: dict | None = None
-    if action_command or action_instructions:
-        extra = {
-            "action_command": action_command,
-            "action_instructions": action_instructions,
-            "action_mode": action_mode,
-            "action_status": "pending",
-        }
+    if (
+        action_command
+        or action_instructions
+        or wake_client
+        or attention_triggers
+        or conversation_id
+        or scope
+    ):
+        extra = {}
+        if action_command or action_instructions or wake_client:
+            extra.update({
+                "action_command": action_command,
+                "action_instructions": action_instructions,
+                "action_mode": action_mode,
+                "action_status": "pending",
+            })
+        if wake_client:
+            extra.update({
+                "wake_client": wake_client,
+                "wake_session_id": wake_session_id,
+                "wake_cwd": wake_cwd,
+                "wake_model": wake_model,
+                "wake_agent": wake_agent,
+            })
+        if attention_triggers:
+            extra["attention_triggers"] = attention_triggers
+        if conversation_id:
+            extra["conversation_id"] = conversation_id
+            extra["reminder_scope"] = "chat"
+        elif scope:
+            extra["reminder_scope"] = scope
 
     rid = store.add_reminder(
         title,
@@ -302,6 +351,58 @@ def create_reminder(
     )
     _try_repack(store)
     return rid
+
+
+def reminder_matches_conversation(
+    reminder: dict,
+    conversation_id: str | None,
+    *,
+    include_global: bool = True,
+    include_legacy: bool = False,
+) -> bool:
+    """Return whether a reminder should be visible in a conversation hook."""
+    return item_matches_conversation(
+        reminder,
+        conversation_id,
+        include_global=include_global,
+        include_legacy=include_legacy,
+    )
+
+
+def filter_reminders_for_conversation(
+    reminders: list[dict],
+    conversation_id: str | None,
+    *,
+    include_global: bool = True,
+    include_legacy: bool = False,
+) -> list[dict]:
+    """Filter reminders for a hook-visible reminder board."""
+    return [
+        reminder for reminder in reminders
+        if reminder_matches_conversation(
+            reminder,
+            conversation_id,
+            include_global=include_global,
+            include_legacy=include_legacy,
+        )
+    ]
+
+
+def scoped_due_reminders(
+    store: Store,
+    conversation_id: str | None,
+    *,
+    include_global: bool = True,
+    include_legacy: bool = False,
+    as_of: str | None = None,
+) -> list[dict]:
+    """Return due reminders visible to a specific conversation hook."""
+    return filter_reminders_for_conversation(
+        store.due_reminders(as_of=as_of),
+        conversation_id,
+        include_global=include_global,
+        include_legacy=include_legacy,
+    )
 
 
 def snooze_reminder(
@@ -384,14 +485,115 @@ def advance_recurring(store: Store, reminder_id: str) -> str | None:
             store.complete_reminder(reminder_id)
             return None
 
-    store.update_reminder(
-        reminder_id,
-        next_due=next_due,
-        last_fired=_now(),
-        status="active",
-        snooze_until=None,
-    )
+    updates: dict = {
+        "next_due": next_due,
+        "last_fired": _now(),
+        "status": "active",
+        "snooze_until": None,
+    }
+    # Reset the action for the next occurrence. execute_action skips any
+    # reminder whose action_status is completed/running, so without this reset
+    # a recurring action would execute exactly once and every later occurrence
+    # would silently no-op (last action_result is kept as the last-run record).
+    # A live "running" marker is left alone — resetting it would let the next
+    # occurrence overlap an execution still in flight; if the runner died, the
+    # stale-reclaim in execute_action recovers it on the next attempt.
+    # "paused" (staleness parking) is also preserved — only a deliberate
+    # manual exec may resume a parked job.
+    extra = dict(r.get("extra") or {})
+    if extra.get("action_status") and extra["action_status"] not in ("running", "paused"):
+        extra["action_status"] = "pending"
+        updates["extra"] = extra
+
+    store.update_reminder(reminder_id, **updates)
     return next_due
+
+
+_CHECK_LOCK_KEY = "reminder_check_lock"
+_CHECK_LOCK_TTL = 120  # seconds — well past a normal sweep, short enough that
+                       # a crashed holder only delays the next check briefly
+
+
+def _acquire_check_lock(store: Store, ttl: int = _CHECK_LOCK_TTL) -> str | None:
+    """Atomically claim this graph's reminder-sweep lock, or return None.
+
+    Multiple schedulers legitimately run ``check_and_fire`` on the same graph
+    (kin cron's step-0/step-10 checks, the dedicated remind-check job, manual
+    ``kin remind check``). Without mutual exclusion two concurrent sweeps read
+    the same due list and each dispatches the notification and executes the
+    action before either writes state — a double-fire. The lock value is
+    ``token|expires_iso`` in the meta table; the conditional UPDATE is atomic
+    under SQLite's write lock, so exactly one contender wins. An expired value
+    (crashed holder) is claimable immediately.
+    """
+    import uuid
+
+    token = uuid.uuid4().hex
+    now = _now_dt()
+    expires = (now + datetime.timedelta(seconds=ttl)).isoformat(timespec="seconds")
+    now_iso = now.isoformat(timespec="seconds")
+    conn = store.conn
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES (?, '')",
+        (_CHECK_LOCK_KEY,),
+    )
+    cur = conn.execute(
+        """UPDATE meta SET value = ?
+           WHERE key = ?
+             AND (value = '' OR substr(value, instr(value, '|') + 1) < ?)""",
+        (f"{token}|{expires}", _CHECK_LOCK_KEY, now_iso),
+    )
+    conn.commit()
+    return token if cur.rowcount == 1 else None
+
+
+def _renew_check_lock(store: Store, token: str,
+                      ttl: int = _CHECK_LOCK_TTL) -> bool:
+    """Extend a held lock's expiry. Returns False if the lock was lost.
+
+    A sweep can legitimately outlive the base TTL — a single reminder action
+    has a 300s subprocess budget and a sweep may run several sequentially. The
+    holder heartbeats before each reminder so the lock never looks abandoned
+    while work is in flight; only a genuinely dead holder stops renewing.
+    """
+    expires = (_now_dt() + datetime.timedelta(seconds=ttl)).isoformat(
+        timespec="seconds"
+    )
+    cur = store.conn.execute(
+        "UPDATE meta SET value = ? WHERE key = ? AND value LIKE ?",
+        (f"{token}|{expires}", _CHECK_LOCK_KEY, f"{token}|%"),
+    )
+    store.conn.commit()
+    return cur.rowcount == 1
+
+
+def _release_check_lock(store: Store, token: str) -> None:
+    store.conn.execute(
+        "UPDATE meta SET value = '' WHERE key = ? AND value LIKE ?",
+        (_CHECK_LOCK_KEY, f"{token}|%"),
+    )
+    store.conn.commit()
+
+
+def _action_is_stale(reminder: dict, config: Config) -> bool:
+    """True when a due reminder's action is too overdue to auto-execute.
+
+    Staleness anchors to the effective trigger time: a snoozed reminder was
+    explicitly deferred, so its snooze expiry — not the original next_due —
+    is when it became actionable. Without that anchor a deliberate 48h snooze
+    would be misclassified as an abandoned backlog the moment it expired.
+    """
+    max_overdue = int(getattr(config.reminders, "max_action_overdue", 86400) or 0)
+    if max_overdue <= 0:
+        return False
+    try:
+        anchor = datetime.datetime.fromisoformat(reminder["next_due"])
+        snooze = reminder.get("snooze_until")
+        if snooze:
+            anchor = max(anchor, datetime.datetime.fromisoformat(snooze))
+        return (_now_dt() - anchor).total_seconds() > max_overdue
+    except (KeyError, ValueError, TypeError):
+        return True  # no parseable trigger time — no basis to claim it's fresh
 
 
 def check_and_fire(
@@ -403,11 +605,29 @@ def check_and_fire(
     If a reminder has an action and ``config.reminders.action_enabled`` is True,
     executes the action.  Successful actions auto-complete the reminder.
 
+    Only one sweep runs per graph at a time (see ``_acquire_check_lock``); a
+    contender that loses the lock returns [] — the holder is already firing
+    everything due.
+
     Returns list of fired reminders.
     """
     if not config.reminders.enabled:
         return []
 
+    token = _acquire_check_lock(store)
+    if token is None:
+        return []
+    try:
+        return _check_and_fire_locked(store, config, token)
+    finally:
+        _release_check_lock(store, token)
+
+
+def _check_and_fire_locked(
+    store: Store,
+    config: Config,
+    token: str,
+) -> list[dict]:
     from .notify import dispatch, is_user_idle
 
     # Skip all notifications if user is idle beyond threshold
@@ -421,6 +641,13 @@ def check_and_fire(
             # Don't fire; leave as-is so it fires when user returns
             continue
 
+        # Heartbeat before each reminder: dispatch + action can take minutes
+        # (300s subprocess budget apiece), far past the base TTL. Losing the
+        # lock means a contender legitimately reclaimed it — stop rather than
+        # risk double-firing what it is now processing.
+        if not _renew_check_lock(store, token):
+            break
+
         # Determine channels for this reminder
         channels = r.get("channels") or []
         if not channels:
@@ -429,9 +656,18 @@ def check_and_fire(
         # Dispatch notification
         dispatch(r, config, channel_names=channels)
 
-        # Execute action if present and enabled
-        if config.reminders.action_enabled:
-            from .actions import execute_action, has_action
+        # Execute action if present, enabled, and not stale. The staleness
+        # guard is a hard safety line: a wake reminder minutes overdue is a
+        # live workflow and executes; one overdue by more than
+        # max_action_overdue means the workflow it belonged to is long gone —
+        # auto-executing it (worst case: a first-ever scheduler install
+        # discovering months of due pollers) detonates a swarm of headless
+        # agents. Stale ones notify only; run `kin remind exec` to run one
+        # deliberately.
+        from .actions import execute_action, has_action
+
+        stale = _action_is_stale(r, config)
+        if config.reminders.action_enabled and not stale:
             if has_action(r):
                 result = execute_action(store, r, config)
                 if result.get("status") == "completed":
@@ -445,6 +681,12 @@ def check_and_fire(
         if r["reminder_type"] == "recurring":
             # Advance to next occurrence
             advance_recurring(store, r["id"])
+            if stale and has_action(r):
+                # Advancing re-arms the action for an occurrence one period
+                # away — which would resurrect a stale poller swarm, merely
+                # time-shifted. Park it instead: notify-only every occurrence
+                # until a deliberate `kin remind exec` resumes the job.
+                _pause_action(store, r["id"])
         else:
             # Mark as fired (pending user action)
             store.update_reminder(r["id"], status="fired", last_fired=_now())
@@ -452,6 +694,16 @@ def check_and_fire(
         fired.append(r)
 
     return fired
+
+
+def _pause_action(store: Store, reminder_id: str) -> None:
+    """Mark a reminder's action paused — sweeps skip it, manual exec resumes."""
+    r = store.get_reminder(reminder_id)
+    if r is None:
+        return
+    extra = dict(r.get("extra") or {})
+    extra["action_status"] = "paused"
+    store.update_reminder(reminder_id, extra=extra)
 
 
 def auto_snooze_stale(store: Store, config: Config) -> int:
@@ -475,6 +727,12 @@ def auto_snooze_stale(store: Store, config: Config) -> int:
     count = 0
     for row in rows:
         r = store._reminder_to_dict(row)
+        # Re-check right before writing: the user (or another checker) may
+        # have completed/cancelled it since the SELECT — a blind snooze would
+        # resurrect it.
+        current = store.get_reminder(r["id"])
+        if not current or current["status"] != "fired":
+            continue
         snooze_until = (now + datetime.timedelta(seconds=snooze_duration)).isoformat(
             timespec="seconds"
         )
@@ -506,10 +764,25 @@ def format_reminder(reminder: dict) -> str:
 
     # Action info
     extra = reminder.get("extra") or {}
-    if extra.get("action_command") or extra.get("action_instructions"):
+    if (
+        extra.get("action_command")
+        or extra.get("action_instructions")
+        or extra.get("wake_client")
+    ):
         a_status = extra.get("action_status", "pending")
         a_mode = extra.get("action_mode", "auto")
         lines.append(f"    Action [{a_mode}]: {a_status}")
+        if extra.get("wake_client"):
+            target = extra["wake_client"]
+            if extra.get("wake_session_id"):
+                target += f" session={extra['wake_session_id']}"
+            lines.append(f"      Wake: {target}")
+            if extra.get("wake_cwd"):
+                lines.append(f"      Cwd: {extra['wake_cwd']}")
+            if extra.get("wake_model"):
+                lines.append(f"      Model: {extra['wake_model']}")
+            if extra.get("wake_agent"):
+                lines.append(f"      Agent: {extra['wake_agent']}")
         if extra.get("action_command"):
             lines.append(f"      Command: {extra['action_command']}")
         if extra.get("action_instructions"):

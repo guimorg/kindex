@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _json_default(obj):
@@ -23,7 +24,7 @@ def _jdumps(obj):
     return json.dumps(obj, default=_json_default)
 
 from .config import Config
-from .schema import CREATE_TABLES, SCHEMA_VERSION
+from .schema import CREATE_TABLES, SCHEMA_VERSION, edit_class_for
 
 
 def _now() -> str:
@@ -34,6 +35,91 @@ def _uuid() -> str:
     return uuid.uuid4().hex[:12]
 
 
+class EditPolicyError(ValueError):
+    """An edit was refused by the node-type edit policy."""
+
+
+class LockHeldError(RuntimeError):
+    """The node is locked by another agent and force was not given."""
+
+
+class ProfileMismatchError(RuntimeError):
+    """The database is stamped for a different profile than the active one."""
+
+
+# Extra-JSON keys owned by dedicated subsystems (tasks, sessions,
+# coordination, locks). edit_node must never alter these.
+RESERVED_EXTRA_KEYS = frozenset({
+    "claim", "lock", "coord_status", "session_status", "task_status",
+    "current_state", "messages", "members", "resources", "inject_messages",
+})
+
+_EXPIRES_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DIFF_TRUNCATE = 500
+
+# Lock-error remedy for the supersede path: neither `kin supersede` nor the
+# MCP supersede tool exposes a force flag (per contract), so the message must
+# name the remedy that actually exists on those surfaces.
+_SUPERSEDE_LOCK_REMEDY = (
+    "release the lock first (kin unlock --force / lock_release force=True); "
+    "supersede does not take a force flag"
+)
+
+
+def _validate_expires(expires: str) -> None:
+    """Accept YYYY-MM-DD only (zero-padded, real calendar date)."""
+    if not isinstance(expires, str) or not _EXPIRES_RE.match(expires):
+        raise ValueError(f"expires must be YYYY-MM-DD, got {expires!r}")
+    try:
+        datetime.strptime(expires, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(
+            f"expires must be a real YYYY-MM-DD date, got {expires!r}"
+        ) from None
+
+
+def _trunc(value: Any, limit: int = _DIFF_TRUNCATE) -> str | None:
+    """Stringify a diff value and truncate it for activity-log storage."""
+    if value is None:
+        return None
+    s = value if isinstance(value, str) else _jdumps(value)
+    return s if len(s) <= limit else s[:limit]
+
+
+def active_lock(node: dict) -> dict | None:
+    """Return extra['lock'] if present and unexpired, else None.
+
+    Expiry is lazy: an expired lock is treated as absent (callers may
+    overwrite it); the daemon sweep clears them from storage eventually.
+    """
+    extra = node.get("extra") or {}
+    lock = extra.get("lock") if isinstance(extra, dict) else None
+    if not isinstance(lock, dict):
+        return None
+    expires_at = lock.get("expires_at")
+    if expires_at:
+        try:
+            if datetime.fromisoformat(expires_at) <= datetime.now():
+                return None
+        except (ValueError, TypeError):
+            pass  # unparseable expiry — keep the lock active rather than dropping it
+    return lock
+
+
+def node_expired(node: dict, today: str | None = None) -> bool:
+    """True if extra['expires'] (YYYY-MM-DD) is strictly in the past.
+
+    Matches active_watches() semantics: a node expiring today is still live.
+    Generic — usable by hooks/attention/daemon for any node type.
+    """
+    extra = node.get("extra") or {}
+    expires = extra.get("expires") if isinstance(extra, dict) else None
+    if not expires or not isinstance(expires, str):
+        return False
+    today = today or _now()[:10]
+    return expires < today
+
+
 class Store:
     """SQLite-backed knowledge graph with FTS5 full-text search.
 
@@ -41,24 +127,67 @@ class Store:
     human-readable canonical source; the store indexes them.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, sqlite_timeout: float = 5.0):
         self.config = config
                 # Support both kindex.db (new) and conv.db (legacy)
         new_db = config.data_path / "kindex.db"
         old_db = config.data_path / "conv.db"
         self.db_path = old_db if old_db.exists() and not new_db.exists() else new_db
         self._conn: sqlite3.Connection | None = None
+        self._sqlite_timeout = max(0.0, float(sqlite_timeout))
+        # Profile stamp guard: configs that carry an active_profile (added by
+        # the profiles feature) bind this database to that profile name.
+        self._expected_profile: str | None = getattr(config, "active_profile", None)
 
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
             self.config.data_path.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self.db_path))
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=self._sqlite_timeout,
+            )
             self._conn.row_factory = sqlite3.Row
+            self._conn.execute(f"PRAGMA busy_timeout={int(self._sqlite_timeout * 1000)}")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._init_schema()
+            self._check_profile_stamp()
         return self._conn
+
+    def _check_profile_stamp(self) -> None:
+        """Enforce the per-database profile stamp (meta key 'kin_profile').
+
+        No active profile -> no stamping, no check (legacy single-graph).
+        Active profile + unstamped db -> stamp it, unless the config marks
+        this open as a --data-dir override (_stamp_on_open False): an
+        explicit override must never bind a foreign database to the active
+        profile. An existing mismatched stamp still hard-refuses.
+        Active profile != stamp -> close the connection and raise.
+        """
+        expected = self._expected_profile
+        if not expected:
+            return
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'kin_profile'"
+        ).fetchone()
+        if row is None:
+            if not getattr(self.config, "_stamp_on_open", True):
+                return
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('kin_profile', ?)",
+                (expected,),
+            )
+            self._conn.commit()
+            return
+        stamped = row["value"]
+        if stamped != expected:
+            conn, self._conn = self._conn, None
+            conn.close()
+            raise ProfileMismatchError(
+                f"Database {self.db_path} is stamped for profile '{stamped}' "
+                f"but the active profile is '{expected}'"
+            )
 
     def _init_schema(self) -> None:
         # Check if this is an existing database that needs migration
@@ -150,6 +279,10 @@ class Store:
                         created_at TEXT NOT NULL DEFAULT (datetime('now'))
                     );
                     CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status);
+                    CREATE INDEX IF NOT EXISTS idx_suggestions_status_created
+                        ON suggestions(status, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_suggestions_status_pair
+                        ON suggestions(status, concept_a, concept_b);
                 """)
                 c.commit()
             except Exception:
@@ -181,6 +314,43 @@ class Store:
                     CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
                     CREATE INDEX IF NOT EXISTS idx_reminders_next_due ON reminders(next_due);
                     CREATE INDEX IF NOT EXISTS idx_reminders_priority ON reminders(priority);
+                """)
+                c.commit()
+            except Exception:
+                pass
+
+        if current_version < 6:
+            # v6: index suggestions for scheduled dream workloads
+            try:
+                c.executescript("""
+                    CREATE INDEX IF NOT EXISTS idx_suggestions_status_created
+                        ON suggestions(status, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_suggestions_status_pair
+                        ON suggestions(status, concept_a, concept_b);
+                """)
+                c.commit()
+            except Exception:
+                pass
+
+        if current_version < 7:
+            # v7: stigmergic injection pheromone (retrieval channel, not topology)
+            try:
+                c.executescript("""
+                    CREATE TABLE IF NOT EXISTS injection_pheromone (
+                        node_id TEXT NOT NULL REFERENCES nodes(id),
+                        context TEXT NOT NULL DEFAULT '',
+                        strength REAL NOT NULL DEFAULT 0.0,
+                        deposits INTEGER NOT NULL DEFAULT 0,
+                        reinforcements INTEGER NOT NULL DEFAULT 0,
+                        missed INTEGER NOT NULL DEFAULT 0,
+                        last_deposit TEXT NOT NULL DEFAULT (datetime('now')),
+                        last_decay TEXT NOT NULL DEFAULT (datetime('now')),
+                        PRIMARY KEY (node_id, context)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pheromone_node
+                        ON injection_pheromone(node_id);
+                    CREATE INDEX IF NOT EXISTS idx_pheromone_strength
+                        ON injection_pheromone(strength DESC);
                 """)
                 c.commit()
             except Exception:
@@ -314,6 +484,27 @@ class Store:
         except Exception:
             return []
 
+    def suggestion_exists(
+        self,
+        concept_a: str,
+        concept_b: str,
+        *,
+        status: str = "pending",
+    ) -> bool:
+        """Return true if a suggestion exists for this pair in either order."""
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM suggestions
+             WHERE status = ? AND concept_a = ? AND concept_b = ?
+            UNION ALL
+            SELECT 1 FROM suggestions
+             WHERE status = ? AND concept_a = ? AND concept_b = ?
+            LIMIT 1
+            """,
+            (status, concept_a, concept_b, status, concept_b, concept_a),
+        ).fetchone()
+        return row is not None
+
     def update_suggestion(self, suggestion_id: int, status: str) -> None:
         """Update suggestion status (accepted/rejected)."""
         self.conn.execute(
@@ -395,15 +586,13 @@ class Store:
                                   provenance="auto-linked from prov_who",
                                   bidirectional=False)
 
-        # Auto-embed for vector search (best-effort, no failure propagation)
+        # Queue for vector embedding — deferred to the daemon so a slow
+        # embedding provider never stalls the add hot path (best-effort).
         try:
-            from .vectors import is_available, upsert_embedding
-            if is_available():
-                embed_text = f"{title} {content}".strip()
-                if embed_text:
-                    upsert_embedding(self, nid, embed_text)
+            from .vectors import enqueue_embedding
+            enqueue_embedding(self, nid)
         except Exception:
-            pass  # vectors not installed or embed failed — node still created
+            pass  # vectors not installed — node still created
 
         return nid
 
@@ -416,6 +605,23 @@ class Store:
             "UPDATE nodes SET last_accessed = ? WHERE id = ?", (_now(), node_id))
         self.conn.commit()
         return self._row_to_dict(row)
+
+    def get_node_domains(self, node_id: str) -> list[str]:
+        """Read a node's domains/tags without touching last_accessed (non-mutating).
+
+        Used on hot paths (e.g. prime) that only need a node's client scope and
+        must not bump the freshness-decay signal or commit per lookup.
+        """
+        if not node_id:
+            return []
+        row = self.conn.execute(
+            "SELECT domains FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not row or not row[0]:
+            return []
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return []
 
     def get_node_by_title(self, title: str) -> dict | None:
         """Match by title or AKA (case-insensitive)."""
@@ -434,8 +640,14 @@ class Store:
                 return d
         return None
 
-    def update_node(self, node_id: str, **fields) -> None:
-        """Update specific fields on a node."""
+    def update_node(self, node_id: str, _log_activity: bool = True,
+                    **fields) -> None:
+        """Update specific fields on a node.
+
+        ``_log_activity`` is private: internal callers that write their own
+        richer activity entry (edit_node) pass False to avoid double-logging
+        the same change. External semantics are unchanged.
+        """
         allowed = {"title", "content", "aka", "intent", "weight", "domains",
                    "tags", "status", "audience", "prov_who", "prov_activity",
                    "prov_why", "prov_source", "extra"}
@@ -461,8 +673,9 @@ class Store:
         vals = list(updates.values()) + [node_id]
         self.conn.execute(f"UPDATE nodes SET {sets} WHERE id = ?", vals)
         self.conn.commit()
-        self._log("update_node", node_id, "",
-                  details={"fields": list(fields.keys())})
+        if _log_activity:
+            self._log("update_node", node_id, "",
+                      details={"fields": list(fields.keys())})
 
     def delete_node(self, node_id: str) -> None:
         # Capture title before deletion for logging
@@ -472,6 +685,12 @@ class Store:
                           (node_id, node_id))
         self.conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
         self.conn.commit()
+        # Drop the vector embedding too (best-effort — table may not exist)
+        try:
+            from .vectors import delete_embedding
+            delete_embedding(self, node_id)
+        except Exception:
+            pass
         self._log("delete_node", node_id, title)
 
     def all_nodes(self, node_type: str | None = None,
@@ -505,6 +724,436 @@ class Store:
             "SELECT * FROM nodes ORDER BY updated_at DESC LIMIT ?", (n,)
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
+
+    def nodes_with_expiry(self, status: str = "active",
+                          limit: int = 1000) -> list[dict]:
+        """Nodes carrying extra['expires'] (cheap LIKE prefilter).
+
+        The `"expires"` pattern (quote-delimited) deliberately does not match
+        `"expires_at"` lock timestamps. Callers confirm with node_expired().
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM nodes WHERE status = ? AND extra LIKE ? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (status, '%"expires"%', limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    # ── Edit / supersede / atomic extra ─────────────────────────────────
+
+    def _check_lock(self, node: dict, actor: str | None, force: bool,
+                    *, remedy: str = "pass force to override") -> None:
+        """Raise LockHeldError on a foreign unexpired lock unless force.
+
+        `remedy` is the actionable hint appended to the error — callers
+        whose surface has no force flag (e.g. supersede) pass one that
+        names a remedy that actually exists on that surface.
+        """
+        if force:
+            return
+        lock = active_lock(node)
+        if lock is None:
+            return
+        holder = lock.get("agent") or ""
+        if actor is not None and holder == actor:
+            return
+        until = f" until {lock['expires_at']}" if lock.get("expires_at") else ""
+        raise LockHeldError(
+            f"Node {node.get('id')} is locked by '{holder or 'unknown'}'{until} "
+            f"— {remedy}"
+        )
+
+    @staticmethod
+    def _check_mutable_status(node: dict, force: bool) -> None:
+        """Refuse edit/supersede on dead nodes.
+
+        - superseded: always refused (force does NOT bypass) — the error
+          names the successor so the caller can retarget it.
+        - archived: refused unless force.
+        """
+        status = node.get("status") or "active"
+        if status == "superseded":
+            successor = (node.get("extra") or {}).get("superseded_by") or "unknown"
+            raise EditPolicyError(
+                f"Node {node.get('id')} was superseded by {successor} "
+                f"— operate on that node instead"
+            )
+        if status == "archived" and not force:
+            raise EditPolicyError(
+                f"Node {node.get('id')} is archived — pass force to modify it"
+            )
+
+    def edit_node(
+        self,
+        node_id: str,
+        actor: str | None = None,
+        force: bool = False,
+        policy_overrides: dict[str, str] | None = None,
+        *,
+        title: str | None = None,
+        content: str | None = None,
+        append: str | None = None,
+        add_tags: list[str] | None = None,
+        remove_tags: list[str] | None = None,
+        intent: str | None = None,
+        aka: list[str] | None = None,
+        expires: str | None = None,
+    ) -> dict:
+        """Policy-aware node edit. Routes through update_node (UPDATE only).
+
+        - editable types: all fields allowed
+        - additive types: only append + expires (replacement -> supersede_node)
+        - managed types: always refused (task/session/coordination tooling owns them)
+        Refuses a foreign unexpired lock unless force. Logs per-field old/new
+        diffs to the activity log. Reserved extra keys are never altered.
+        Returns the updated node dict.
+        """
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"No node with id '{node_id}'")
+
+        provided = {
+            name: val for name, val in (
+                ("title", title), ("content", content), ("append", append),
+                ("add_tags", add_tags), ("remove_tags", remove_tags),
+                ("intent", intent), ("aka", aka), ("expires", expires),
+            ) if val is not None
+        }
+        if not provided:
+            raise ValueError("edit_node requires at least one field to change")
+
+        node_type = node.get("type", "concept")
+        cls = edit_class_for(node_type, policy_overrides)
+        if cls == "managed":
+            raise EditPolicyError(
+                f"Node type '{node_type}' is managed — edit is not allowed; "
+                f"use the dedicated task/session/coordination tools"
+            )
+        if cls == "additive":
+            disallowed = sorted(set(provided) - {"append", "expires"})
+            if disallowed:
+                raise EditPolicyError(
+                    f"Node type '{node_type}' is additive — only append and "
+                    f"expires are allowed (got: {', '.join(disallowed)}); "
+                    f"use supersede to replace it"
+                )
+
+        self._check_mutable_status(node, force)
+        self._check_lock(node, actor, force)
+        if expires is not None:
+            _validate_expires(expires)
+
+        updates: dict[str, Any] = {}
+        diffs: dict[str, dict] = {}
+
+        old_title = node.get("title") or ""
+        new_title = old_title
+        if title is not None and title != old_title:
+            updates["title"] = title
+            diffs["title"] = {"old": _trunc(old_title), "new": _trunc(title)}
+            new_title = title
+
+        old_content = node.get("content") or ""
+        new_content = content if content is not None else old_content
+        if append:
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            header = f"[addendum {stamp} {actor}]" if actor else f"[addendum {stamp}]"
+            prefix = f"{new_content}\n\n" if new_content else ""
+            new_content = f"{prefix}{header}\n{append}"
+        if new_content != old_content:
+            updates["content"] = new_content
+            diffs["content"] = {"old": _trunc(old_content), "new": _trunc(new_content)}
+
+        if intent is not None and intent != (node.get("intent") or ""):
+            updates["intent"] = intent
+            diffs["intent"] = {"old": _trunc(node.get("intent") or ""),
+                               "new": _trunc(intent)}
+
+        if aka is not None:
+            old_aka = list(node.get("aka") or [])
+            if list(aka) != old_aka:
+                updates["aka"] = list(aka)
+                diffs["aka"] = {"old": _trunc(old_aka), "new": _trunc(list(aka))}
+
+        if "title" in updates and old_title:
+            # A rename keeps the old title reachable: preserve it as an alias
+            # so title-keyed dedup (session capture, inbox ingest, dream_deep
+            # idempotency) still matches via get_node_by_title's AKA path.
+            base_aka = list(updates.get("aka", node.get("aka") or []))
+            lowered = {a.lower() for a in base_aka}
+            if (old_title.lower() != new_title.lower()
+                    and old_title.lower() not in lowered):
+                preserved = base_aka + [old_title]
+                updates["aka"] = preserved
+                diffs["aka"] = {"old": _trunc(list(node.get("aka") or [])),
+                                "new": _trunc(preserved)}
+
+        if add_tags or remove_tags:
+            old_domains = list(node.get("domains") or [])
+            removed = set(remove_tags or [])
+            new_domains = [d for d in old_domains if d not in removed]
+            for t in add_tags or []:
+                if t not in new_domains:
+                    new_domains.append(t)
+            if new_domains != old_domains:
+                updates["domains"] = new_domains
+                diffs["tags"] = {"old": _trunc(old_domains), "new": _trunc(new_domains)}
+
+        exp_diff: dict[str, Any] = {}
+        if expires is not None:
+            # The expires merge must not write the extra column from the
+            # pre-check snapshot: a lock (or any extra key) committed by a
+            # concurrent agent between get_node above and the write would be
+            # silently erased. Route it through atomic_extra_update and
+            # re-check the lock against the fresh in-transaction state —
+            # LockHeldError raised here propagates and rolls back.
+            def _set_expires(fresh: dict) -> None:
+                self._check_lock({"id": node_id, "extra": fresh}, actor, force)
+                old_expires = fresh.get("expires")
+                if expires != old_expires:
+                    fresh["expires"] = expires
+                    exp_diff["old"] = old_expires
+                    exp_diff["new"] = expires
+
+            self.atomic_extra_update(node_id, _set_expires)
+            if exp_diff:
+                diffs["expires"] = {"old": exp_diff["old"],
+                                    "new": exp_diff["new"]}
+
+        if updates:
+            # _log_activity=False: edit_node writes its own (richer) entry
+            # below — without it every edit appears twice in the changelog.
+            self.update_node(node_id, _log_activity=False, **updates)
+        if updates or exp_diff:
+            self._log("edit_node", node_id, updates.get("title", old_title),
+                      actor or "", {"diffs": diffs, "type": node_type})
+            if "title" in updates or "content" in updates:
+                # Queue re-embedding — deferred to the daemon so a slow
+                # embedding provider never stalls the edit hot path
+                # (best-effort, like add_node).
+                try:
+                    from .vectors import enqueue_embedding
+                    enqueue_embedding(self, node_id)
+                except Exception:
+                    pass  # vectors not installed — edit persisted
+
+        return self.get_node(node_id)
+
+    def supersede_node(
+        self,
+        node_id: str,
+        new_text: str,
+        actor: str | None = None,
+        expires: str | None = None,
+        reason: str | None = None,
+        force: bool = False,
+        policy_overrides: dict[str, str] | None = None,
+    ) -> dict:
+        """Replace a node with a fresh one, preserving history.
+
+        Single transaction: insert the new node (same type/tags/audience/
+        intent, fresh id), edge new-[supersedes]->old, mark the old node
+        status='superseded' with extra['superseded_by'], and migrate its
+        injection_pheromone trails to the new node. Lock check as edit_node.
+        Managed types (task/session/coordination) are refused like edit_node
+        — their tooling owns their state. Superseded nodes cannot be
+        superseded again (the error names the successor); archived nodes
+        require force. Returns the new node dict.
+        """
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"No node with id '{node_id}'")
+        node_type = node.get("type", "concept")
+        cls = edit_class_for(node_type, policy_overrides)
+        if cls == "managed":
+            raise EditPolicyError(
+                f"Node type '{node_type}' is managed — supersede is not "
+                f"allowed; use the dedicated task/session/coordination tools"
+            )
+        self._check_mutable_status(node, force)
+        self._check_lock(node, actor, force, remedy=_SUPERSEDE_LOCK_REMEDY)
+        text = (new_text or "").strip()
+        if not text:
+            raise ValueError("supersede_node requires non-empty new_text")
+        if expires is not None:
+            _validate_expires(expires)
+
+        new_id = _uuid()
+        now = _now()
+        title = text[:60].strip()  # same title convention as MCP add
+        new_extra: dict[str, Any] = {"supersedes": node_id}
+        if expires:
+            new_extra["expires"] = expires
+        if reason:
+            new_extra["supersede_reason"] = reason
+
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-verify status inside the transaction: two concurrent
+            # supersedes serialize on BEGIN IMMEDIATE, so the second one
+            # must see the first's status flip and abort instead of
+            # creating a competing successor.
+            row = conn.execute(
+                "SELECT status, extra FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No node with id '{node_id}'")
+            try:
+                cur_extra = json.loads(row["extra"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                cur_extra = {}
+            if not isinstance(cur_extra, dict):
+                cur_extra = {}
+            cur_status = row["status"] or "active"
+            if cur_status == "superseded":
+                successor = cur_extra.get("superseded_by") or "unknown"
+                raise EditPolicyError(
+                    f"Node {node_id} was superseded by {successor} "
+                    f"— operate on that node instead"
+                )
+            if cur_status == "archived" and not force:
+                raise EditPolicyError(
+                    f"Node {node_id} is archived — pass force to modify it"
+                )
+            # Re-check the lock against the fresh in-transaction extra: a
+            # lock acquired between the pre-flight snapshot and BEGIN
+            # IMMEDIATE must still block the supersede (LockHeldError
+            # propagates to the rollback handler below).
+            self._check_lock({"id": node_id, "extra": cur_extra}, actor, force,
+                             remedy=_SUPERSEDE_LOCK_REMEDY)
+            old_extra = dict(cur_extra)
+            old_extra["superseded_by"] = new_id
+            conn.execute(
+                """INSERT INTO nodes
+                   (id, type, title, content, aka, intent,
+                    prov_who, prov_when, prov_activity, prov_why, prov_source,
+                    weight, domains, status, audience,
+                    created_at, updated_at, last_accessed, extra)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (new_id, node.get("type", "concept"), title, text,
+                 _jdumps([]), node.get("intent") or "",
+                 _jdumps([actor] if actor else []), now, "supersede",
+                 reason or f"Supersedes '{node.get('title', '')}'", node_id,
+                 node.get("weight", 0.5), _jdumps(node.get("domains") or []),
+                 "active", node.get("audience", "private"),
+                 now, now, now, _jdumps(new_extra)),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO edges (from_id, to_id, type, weight, provenance) "
+                "VALUES (?, ?, 'supersedes', 0.9, ?)",
+                (new_id, node_id,
+                 f"superseded by {actor}" if actor else "superseded"),
+            )
+            conn.execute(
+                "UPDATE nodes SET status = 'superseded', extra = ?, updated_at = ? "
+                "WHERE id = ?",
+                (_jdumps(old_extra), now, node_id),
+            )
+            conn.execute(
+                "UPDATE OR REPLACE injection_pheromone SET node_id = ? "
+                "WHERE node_id = ?",
+                (new_id, node_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+        self._log("supersede_node", new_id, title, actor or "",
+                  {"superseded": node_id, "reason": reason or ""})
+
+        # Drop the old node's embedding so vector search stops surfacing the
+        # superseded text (best-effort — table may not exist).
+        try:
+            from .vectors import delete_embedding
+            delete_embedding(self, node_id)
+        except Exception:
+            pass
+
+        # Queue the replacement for embedding — deferred to the daemon
+        # (best-effort, like add_node).
+        try:
+            from .vectors import enqueue_embedding
+            enqueue_embedding(self, new_id)
+        except Exception:
+            pass  # vectors not installed — node still created
+
+        return self.get_node(new_id)
+
+    def atomic_extra_update(
+        self, node_id: str, mutator: Callable[[dict], dict | None]
+    ) -> dict:
+        """Atomically read-modify-write a node's extra JSON.
+
+        BEGIN IMMEDIATE serializes concurrent writers (no lost updates across
+        Store handles). The mutator may return a replacement dict or mutate
+        its argument in place and return None. Returns the final extra dict.
+        Raises KeyError on a missing node.
+        """
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT extra FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No node with id '{node_id}'")
+            try:
+                extra = json.loads(row["extra"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            replacement = mutator(extra)
+            final = extra if replacement is None else replacement
+            conn.execute(
+                "UPDATE nodes SET extra = ?, updated_at = ? WHERE id = ?",
+                (_jdumps(final), _now(), node_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return final
+
+    def atomic_archive_expired(self, node_id: str, expired_at: str) -> bool:
+        """Archive a node iff its fresh extra['expires'] is still past.
+
+        BEGIN IMMEDIATE re-reads the row, so an expiry extended (or removed)
+        after the caller's snapshot wins: the node is left untouched and
+        False is returned. Only active nodes are archived; the
+        extra['expired_at'] stamp and the status flip land in the same
+        UPDATE. Returns True when the node was archived.
+        """
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status, extra FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            fresh_extra: dict | None = None
+            if row is not None and (row["status"] or "active") == "active":
+                try:
+                    parsed = json.loads(row["extra"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    parsed = {}
+                if isinstance(parsed, dict) and node_expired({"extra": parsed}):
+                    fresh_extra = parsed
+            if fresh_extra is None:
+                conn.rollback()
+                return False
+            fresh_extra["expired_at"] = expired_at
+            conn.execute(
+                "UPDATE nodes SET status = 'archived', extra = ?, "
+                "updated_at = ? WHERE id = ?",
+                (_jdumps(fresh_extra), _now(), node_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return True
 
     # ── Edge operations ────────────────────────────────────────────────
 
@@ -571,7 +1220,7 @@ class Store:
             rows = self.conn.execute(
                 """SELECT n.*, rank FROM nodes_fts
                    JOIN nodes n ON n.id = nodes_fts.id
-                   WHERE nodes_fts MATCH ?
+                   WHERE nodes_fts MATCH ? AND n.status != 'superseded'
                    ORDER BY rank LIMIT ?""",
                 (fts_query, limit),
             ).fetchall()
@@ -579,7 +1228,8 @@ class Store:
             # Fallback: simple LIKE search if FTS query syntax fails
             rows = self.conn.execute(
                 """SELECT *, 0 as rank FROM nodes
-                   WHERE title LIKE ? OR content LIKE ?
+                   WHERE (title LIKE ? OR content LIKE ?)
+                     AND status != 'superseded'
                    ORDER BY weight DESC LIMIT ?""",
                 (f"%{phrase}%", f"%{phrase}%", limit),
             ).fetchall()
@@ -632,6 +1282,201 @@ class Store:
 
         self.conn.commit()
         return count
+
+    # ── Stigmergic injection pheromone ──────────────────────────────────
+
+    @staticmethod
+    def _decayed_strength(strength: float, last_decay: str, half_life_days: float,
+                          now: datetime | None = None) -> float:
+        """Effective pheromone after exponential decay since last_decay."""
+        if strength <= 0 or half_life_days <= 0:
+            return max(0.0, strength)
+        now = now or datetime.now()
+        try:
+            last = datetime.fromisoformat(last_decay)
+        except (ValueError, TypeError):
+            return strength
+        days = (now - last).total_seconds() / 86400.0
+        if days <= 0:
+            return strength
+        return strength * (0.5 ** (days / half_life_days))
+
+    def _live_node_id(self, node_id: str, max_hops: int = 10) -> str:
+        """Follow extra['superseded_by'] to the live successor (bounded, cycle-safe).
+
+        Returns the input id unchanged when the node is live, missing, or the
+        chain is malformed.
+        """
+        nid = node_id
+        seen = {nid}
+        for _ in range(max_hops):
+            row = self.conn.execute(
+                "SELECT extra FROM nodes WHERE id = ?", (nid,)).fetchone()
+            if row is None:
+                return nid
+            try:
+                extra = json.loads(row["extra"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                return nid
+            succ = extra.get("superseded_by") if isinstance(extra, dict) else None
+            if not succ or not isinstance(succ, str) or succ in seen:
+                return nid
+            seen.add(succ)
+            nid = succ
+        return nid
+
+    def deposit_pheromone(self, node_id: str, context: str = "",
+                          amount: float = 1.0, half_life_days: float = 14.0,
+                          reinforce: bool = False, missed: bool = False) -> float:
+        """Lay (or reinforce) pheromone on a node for a context.
+
+        Folds prior decay into the stored strength before adding `amount`, so the
+        accumulator stays current. Counter bumped depends on the kind of deposit:
+        - default: `deposits` (a node was injected)
+        - reinforce=True: `reinforcements` (a confirmed-useful injection)
+        - missed=True: `missed` (counterfactual — would have helped but wasn't injected)
+        Deposits on a superseded node are redirected to its live successor
+        (supersede_node migrates existing trails exactly once; late deposits —
+        e.g. deferred session-end reinforcement — must follow the same chain
+        or the signal strands on the dead node and boosts it in ranking).
+        Returns the new stored strength.
+        """
+        node_id = self._live_node_id(node_id)
+        now = _now()
+        d_inc = 0 if (reinforce or missed) else 1
+        r_inc = 1 if reinforce else 0
+        m_inc = 1 if missed else 0
+        row = self.conn.execute(
+            "SELECT strength, deposits, reinforcements, missed, last_decay "
+            "FROM injection_pheromone WHERE node_id = ? AND context = ?",
+            (node_id, context),
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO injection_pheromone "
+                "(node_id, context, strength, deposits, reinforcements, missed, last_deposit, last_decay) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (node_id, context, round(amount, 4), d_inc, r_inc, m_inc, now, now),
+            )
+            self.conn.commit()
+            return round(amount, 4)
+
+        decayed = self._decayed_strength(
+            row["strength"], row["last_decay"], half_life_days)
+        new_strength = round(decayed + amount, 4)
+        self.conn.execute(
+            "UPDATE injection_pheromone SET strength = ?, deposits = ?, "
+            "reinforcements = ?, missed = ?, last_deposit = ?, last_decay = ? "
+            "WHERE node_id = ? AND context = ?",
+            (new_strength,
+             row["deposits"] + d_inc,
+             row["reinforcements"] + r_inc,
+             row["missed"] + m_inc,
+             now, now, node_id, context),
+        )
+        self.conn.commit()
+        return new_strength
+
+    def pheromone_scores(self, node_ids: set[str], context: str = "",
+                         half_life_days: float = 14.0,
+                         min_deposits: int = 5) -> list[tuple[str, float]]:
+        """Decayed pheromone strength per node for retrieval ranking (read-only).
+
+        Uses the context-conditioned trail when it has enough deposits to be
+        statistically real; otherwise falls back to the coarse global trail.
+        """
+        if not node_ids:
+            return []
+        now = datetime.now()
+        ids = list(node_ids)
+        placeholders = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT node_id, context, strength, deposits, last_decay "
+            f"FROM injection_pheromone "
+            f"WHERE node_id IN ({placeholders}) AND context IN ('', ?)",
+            (*ids, context),
+        ).fetchall()
+
+        conditioned: dict[str, sqlite3.Row] = {}
+        glob: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            (conditioned if row["context"] == context and context else glob)[row["node_id"]] = row
+
+        results: list[tuple[str, float]] = []
+        for nid in ids:
+            cond = conditioned.get(nid)
+            chosen = cond if (cond and cond["deposits"] >= min_deposits) else glob.get(nid)
+            if chosen is None:
+                continue
+            strength = self._decayed_strength(
+                chosen["strength"], chosen["last_decay"], half_life_days, now)
+            if strength > 0.0:
+                results.append((nid, strength))
+        return results
+
+    def decay_pheromone(self, half_life_days: float = 14.0,
+                        floor: float = 0.02) -> int:
+        """Write back decayed pheromone strength; prune trails below `floor`.
+
+        Lazy decay already keeps reads correct; this periodic pass keeps the
+        stored values honest and evaporates dead trails. Returns rows pruned.
+        """
+        now = datetime.now()
+        rows = self.conn.execute(
+            "SELECT node_id, context, strength, last_decay FROM injection_pheromone"
+        ).fetchall()
+        pruned = 0
+        for row in rows:
+            strength = self._decayed_strength(
+                row["strength"], row["last_decay"], half_life_days, now)
+            if strength < floor:
+                self.conn.execute(
+                    "DELETE FROM injection_pheromone WHERE node_id = ? AND context = ?",
+                    (row["node_id"], row["context"]),
+                )
+                pruned += 1
+            elif abs(strength - row["strength"]) > 0.001:
+                self.conn.execute(
+                    "UPDATE injection_pheromone SET strength = ?, last_decay = ? "
+                    "WHERE node_id = ? AND context = ?",
+                    (round(strength, 4), now.isoformat(timespec="seconds"),
+                     row["node_id"], row["context"]),
+                )
+        self.conn.commit()
+        return pruned
+
+    def pheromone_stats(self, half_life_days: float = 14.0,
+                        warm_floor: float = 0.5) -> dict:
+        """Decayed signal summary used to decide if pheromone is mature enough
+        to trust in ranking.
+
+        Counts only GRADED signal (reinforcements or counterfactual deposits) —
+        bare injection deposits are popularity, not usefulness, and are excluded.
+        Uses decayed strength so the measure falls when trails cool.
+        """
+        now = datetime.now()
+        rows = self.conn.execute(
+            "SELECT node_id, context, strength, reinforcements, missed, last_decay "
+            "FROM injection_pheromone WHERE reinforcements > 0 OR missed > 0"
+        ).fetchall()
+        warm_nodes: set[str] = set()
+        warm_signal = 0.0
+        signal_events = 0
+        for row in rows:
+            signal_events += (row["reinforcements"] or 0) + (row["missed"] or 0)
+            strength = self._decayed_strength(
+                row["strength"], row["last_decay"], half_life_days, now)
+            if strength >= warm_floor:
+                warm_nodes.add(row["node_id"])
+                warm_signal += strength
+        total_rows = self.conn.execute(
+            "SELECT COUNT(*) FROM injection_pheromone").fetchone()[0]
+        return {
+            "warm_graded_nodes": len(warm_nodes),
+            "warm_signal": round(warm_signal, 3),
+            "signal_events": signal_events,
+            "total_trails": total_rows,
+        }
 
     # ── Operational node queries ────────────────────────────────────────
 
@@ -847,14 +1692,21 @@ class Store:
     # ── Directive mutable state ─────────────────────────────────────────
 
     def update_directive_state(self, node_id: str, state: dict) -> None:
-        """Update the current_state of a directive/operational node."""
+        """Update the current_state of a directive/operational node.
+
+        Routed through atomic_extra_update so a concurrent extra writer
+        (a lock, an expires edit, another set-state) is never clobbered
+        by a stale-snapshot write.
+        """
         node = self.get_node(node_id)
         if not node:
             return
-        extra = node.get("extra") or {}
-        extra["current_state"] = state
-        extra["state_updated_at"] = _now()
-        self.update_node(node_id, extra=extra)
+
+        def _mutate(extra: dict) -> None:
+            extra["current_state"] = state
+            extra["state_updated_at"] = _now()
+
+        self.atomic_extra_update(node_id, _mutate)
         self._log("update_state", node_id, node.get("title", ""),
                   details={"state": state})
 

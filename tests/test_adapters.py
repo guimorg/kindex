@@ -445,7 +445,10 @@ class TestIngestCLI:
             cmd = [sys.executable, "-m", "kindex.cli", *args]
             if data_dir:
                 cmd.extend(["--data-dir", data_dir])
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # `ingest commits` loads the local embedding model and indexes every
+            # commit node, which can take well over 30s on a cold/loaded machine
+            # (and on CI). Give the subprocess generous headroom to avoid flakes.
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
 
         run("init", data_dir=d)
         r = run("ingest", "commits", data_dir=d)
@@ -539,6 +542,38 @@ class TestIngestResult:
 
     def test_str_with_errors(self):
         assert "2 errors" in str(IngestResult(errors=["a", "b"]))
+
+    def test_str_with_warnings(self):
+        r = IngestResult(created=1, warnings=["limit 2 reached after 2 of 5 files"])
+        s = str(r)
+        assert "1 created" in s
+        assert "WARNING: limit 2 reached" in s
+
+
+class TestUnlimitedLimitAtApiBoundaries:
+    def test_linear_first_clamped_to_api_max(self, store, monkeypatch):
+        from kindex.adapters import linear as klinear
+
+        captured = {}
+
+        def fake_query(query, variables):
+            captured.update(variables)
+            return {"data": {"issues": {"nodes": []}}}
+
+        monkeypatch.setattr(klinear, "_linear_query", fake_query)
+        klinear.ingest_issues(store, limit=sys.maxsize)
+        assert captured["first"] == 250
+
+    def test_github_commits_per_page_clamped(self, store):
+        from kindex.adapters.github import ingest_commits
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "[]"
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            ingest_commits(store, "o/r", limit=sys.maxsize)
+        cmd = mock_run.call_args[0][0]
+        assert "per_page=100" in cmd[-1]
 
 
 class TestAdapterProtocol:

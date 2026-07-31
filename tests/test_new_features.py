@@ -309,11 +309,12 @@ class TestKinIndex:
     def test_write_kin_index_output(self, store_and_config, tmp_path):
         store, cfg = store_and_config
 
-        # Add a couple of nodes
+        # Add a couple of nodes (team audience: the non-repo fallback only
+        # includes public/team nodes since the index is meant to be committed)
         store.add_node("Alpha concept", node_type="concept",
-                       domains=["eng"], weight=0.8)
+                       domains=["eng"], weight=0.8, audience="team")
         store.add_node("Beta concept", node_type="decision",
-                       domains=["design"], weight=0.6)
+                       domains=["design"], weight=0.6, audience="team")
 
         from kindex.ingest import write_kin_index
 
@@ -343,6 +344,39 @@ class TestKinIndex:
         path = write_kin_index(store, output_dir)
         assert (output_dir / ".kin").is_dir()
         assert path.exists()
+
+    def test_write_kin_index_uses_canonical_ordering(self, store_and_config, tmp_path):
+        store, cfg = store_and_config
+        store.add_node(
+            "Zeta concept",
+            node_id="z-node",
+            domains=["zeta", "alpha"],
+            weight=1.0,
+            audience="team",
+        )
+        store.add_node(
+            "Alpha concept",
+            node_id="a-node",
+            domains=["beta"],
+            weight=0.1,
+            audience="public",
+        )
+
+        from kindex.ingest import write_kin_index
+
+        output_dir = tmp_path / "canonical"
+        output_dir.mkdir()
+        path = write_kin_index(store, output_dir)
+
+        data = json.loads(path.read_text())
+        node_ids = [node["id"] for node in data["nodes"]]
+        assert node_ids == sorted(node_ids)
+        assert data["domains"] == sorted(data["domains"])
+        assert "generated_at" not in data
+        # No volatile timestamp in the committed snapshot (would churn git history
+        # and conflict on every concurrent merge); per-node updated_at is enough.
+        assert "source_updated_at" not in data
+        assert all("updated_at" in node for node in data["nodes"])
 
 
 # ── 6. Analytics module ──────────────────────────────────────────────

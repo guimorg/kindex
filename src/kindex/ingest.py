@@ -195,7 +195,17 @@ def scan_sessions(
         reverse=True,
     )[:limit]
 
+    # Per-profile session routing: an explicit per-pass predicate (set by
+    # daemon.cron_run_all / kin cron) wins; otherwise one is built from the
+    # configured profiles so EVERY ingest path routes (kin ingest sessions,
+    # MCP ingest, ...). None => no profiles: legacy, take everything.
+    from .routing import effective_session_filter
+
+    session_filter = effective_session_filter(config)
+
     for jsonl_path in jsonl_files:
+        if session_filter is not None and not session_filter(jsonl_path):
+            continue
         session_id = jsonl_path.stem[:12]
         session_slug = f"session-{session_id}"
 
@@ -278,6 +288,12 @@ def scan_codex_sessions(
     count = 0
     from .extract import keyword_extract
 
+    # Per-profile routing by the cwd recorded in the rollout meta (Codex has
+    # no Claude-style encoded dir names). None => no profiles configured.
+    from .routing import effective_cwd_router
+
+    cwd_router = effective_cwd_router(config)
+
     jsonl_files = sorted(
         sessions_dir.rglob("*.jsonl"),
         key=lambda f: f.stat().st_mtime,
@@ -287,6 +303,9 @@ def scan_codex_sessions(
     for jsonl_path in jsonl_files:
         meta, text = _extract_codex_session(jsonl_path, max_chars=8000)
         if not text or len(text) < 50:
+            continue
+
+        if cwd_router is not None and not cwd_router(str(meta.get("cwd") or "")):
             continue
 
         raw_session_id = meta.get("id") or jsonl_path.stem
@@ -428,20 +447,28 @@ def _extract_session_text(jsonl_path: Path, max_chars: int = 8000) -> str:
                     entry = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     continue
-
-                # Extract text from assistant messages
-                role = entry.get("role", "")
-                if role != "assistant":
+                if not isinstance(entry, dict):
                     continue
 
+                # Extract text from assistant messages. Modern Claude Code
+                # transcripts nest the message: {"type": "assistant",
+                # "message": {"role": ..., "content": ...}}; older ones put
+                # role/content at the top level.
+                role = entry.get("role", "")
                 content = entry.get("content", "")
+                if not role and isinstance(entry.get("message"), dict):
+                    role = entry["message"].get("role", "")
+                    content = entry["message"].get("content", "")
+                if role != "assistant":
+                    continue
                 if isinstance(content, str):
                     texts.append(content[:1000])
                     total_len += len(content[:1000])
                 elif isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")[:1000]
+                        if (isinstance(block, dict) and block.get("type") == "text"
+                                and isinstance(block.get("text"), str)):
+                            text = block["text"][:1000]
                             texts.append(text)
                             total_len += len(text)
     except OSError:
@@ -506,6 +533,7 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
 
     count = 0
     all_pending: list[tuple[str, str]] = []  # (source_slug, target_name)
+    project_graphs: dict[str, str] = {}  # project_root -> resolved data_dir
     for project_dir in config.resolved_project_dirs:
         if not project_dir.exists():
             continue
@@ -532,6 +560,27 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
                 data = yaml.safe_load(config_file.read_text()) or {}
             except Exception:
                 continue
+
+            # Register project-local graphs (data_dir in .kin/config) so the
+            # reminder sweep (`remind_check_all`) can service them — these
+            # graphs belong to no profile, so without this registry nothing
+            # scheduled would ever fire their reminders. data_dir must come
+            # from the resolved inheritance chain, matching what load_config
+            # gives interactive sessions: a repo that merely `inherits:` a
+            # template declaring data_dir still gets its own live graph.
+            raw_dir = data.get("data_dir")
+            if not raw_dir:
+                try:
+                    from .config import _load_kin_config_with_inheritance
+                    raw_dir = _load_kin_config_with_inheritance(
+                        config_file).get("data_dir")
+                except Exception:
+                    raw_dir = None
+            if raw_dir:
+                resolved_dir = Path(str(raw_dir)).expanduser()
+                if not resolved_dir.is_absolute():
+                    resolved_dir = project_root / resolved_dir
+                project_graphs[str(project_root)] = str(resolved_dir.resolve())
 
             existing = store.get_node(slug)
             if existing:
@@ -609,6 +658,18 @@ def scan_kin_files(config: Config, store: Store, verbose: bool = False) -> int:
                       f"— target not in graph")
         if verbose and resolved:
             print(f"  Resolved {resolved}/{len(all_pending)} deferred connections")
+
+    # Persist the project-graph registry (merge over previous scans; drop
+    # entries whose data_dir no longer exists so deleted projects age out).
+    try:
+        previous = json.loads(store.get_meta("project_graph_dirs") or "{}")
+        if not isinstance(previous, dict):
+            previous = {}
+    except Exception:
+        previous = {}
+    merged_graphs = {**previous, **project_graphs}
+    merged_graphs = {root: d for root, d in merged_graphs.items() if Path(d).exists()}
+    store.set_meta("project_graph_dirs", json.dumps(merged_graphs))
 
     return count
 
@@ -908,15 +969,52 @@ def detect_expertise(store: "Store", person_node_id: str) -> dict[str, int]:
 # ── Git-tracked index ────────────────────────────────────────────────
 
 
-def _now_iso() -> str:
-    """Return current timestamp in ISO format."""
-    from datetime import datetime
-    return datetime.now(tz=None).isoformat(timespec="seconds")
+def _node_time(node: dict) -> str:
+    return str(
+        node.get("updated_at")
+        or node.get("prov_when")
+        or node.get("created_at")
+        or ""
+    )
+
+
+def _kin_index_node(node: dict) -> dict:
+    return {
+        "domains": sorted(node.get("domains") or []),
+        "id": node["id"],
+        "title": node["title"],
+        "type": node["type"],
+        "updated_at": _node_time(node),
+        "weight": node["weight"],
+    }
+
+
+def _git_ancestor_exists(path: Path) -> bool:
+    """True if path or any ancestor contains a .git entry (dir or file)."""
+    try:
+        p = path.resolve()
+    except OSError:
+        p = path
+    for candidate in (p, *p.parents):
+        try:
+            if (candidate / ".git").exists():
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _detect_repo_for_index(output_dir: Path) -> str | None:
-    """Detect git repo slug from output_dir for repo-scoped indexing."""
+    """Detect git repo slug from output_dir for repo-scoped indexing.
+
+    Returns None only when output_dir is genuinely outside any git repo.
+    When git itself fails (binary missing, timeout, dubious-ownership
+    refusal — routine in CI/containers) but a .git entry exists in
+    output_dir or an ancestor, raises RuntimeError: a failed detection
+    inside a real repo must never downgrade to the global graph head.
+    """
     import subprocess
+    failure: str
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -926,9 +1024,29 @@ def _detect_repo_for_index(output_dir: Path) -> str | None:
         if r.returncode == 0:
             root = Path(r.stdout.strip())
             return root.name.lower().replace(" ", "-")
-    except Exception:
-        pass
+        failure = (r.stderr or "").strip() or f"git exited {r.returncode}"
+    except Exception as e:
+        failure = str(e) or type(e).__name__
+    if _git_ancestor_exists(output_dir):
+        raise RuntimeError(
+            f"git repo detection failed inside a git repo ({failure}); "
+            f"refusing to write a global-graph index into {output_dir}"
+        )
     return None
+
+
+def _kin_declared_audience(output_dir: Path) -> str:
+    """Audience declared by the project's own .kin config ('' if none)."""
+    import yaml
+
+    config_file = output_dir / ".kin" / "config"
+    try:
+        if config_file.is_file():
+            data = yaml.safe_load(config_file.read_text()) or {}
+            return str(data.get("audience", "") or "")
+    except (OSError, yaml.YAMLError):
+        pass
+    return ""
 
 
 def write_kin_index(store: "Store", output_dir: Path) -> Path:
@@ -937,7 +1055,15 @@ def write_kin_index(store: "Store", output_dir: Path) -> Path:
     The .kin/ directory is the standard location for all kindex project
     artifacts.  This file is meant to be git-tracked, giving other tools
     a snapshot of what Kindex knows about this project.  When run inside
-    a git repo, the index is scoped to code nodes belonging to that repo only.
+    a git repo, the index is scoped to code nodes belonging to that repo only
+    (repo-scoped selection is always preferred over the global fallback).
+    The non-repo fallback is a global head — since the file is meant to be
+    committed and shared, it only includes public/team-audience nodes unless
+    the repo's own .kin config declares ``audience: private``.
+
+    Raises RuntimeError (from _detect_repo_for_index) when git detection
+    fails inside what is visibly a git repo — the global fallback head must
+    never be committed into a real repo by accident.
     """
     repo_slug = _detect_repo_for_index(output_dir)
 
@@ -947,27 +1073,48 @@ def write_kin_index(store: "Store", output_dir: Path) -> Path:
         sym_prefix = f"code-sym-{repo_slug}-"
         rows = store.conn.execute(
             "SELECT * FROM nodes WHERE id LIKE ? OR id LIKE ? "
-            "ORDER BY weight DESC, updated_at DESC",
+            "ORDER BY id ASC",
             (f"{mod_prefix}%", f"{sym_prefix}%"),
+        ).fetchall()
+        # Post-filter to the exact id shape the code adapter emits
+        # (code-{mod|sym}-{slug}-{12 hex chars}). The LIKE prefix has no
+        # terminator and slugs contain hyphens, so 'code-mod-api-%' would
+        # otherwise also match another repo's 'code-mod-api-server-…' ids
+        # — leaking that repo's (private-by-default) module/symbol names
+        # into this repo's git-tracked index.
+        id_shape = re.compile(
+            rf"^code-(mod|sym)-{re.escape(repo_slug)}-[0-9a-f]{{12}}$"
+        )
+        nodes = [n for n in (store._row_to_dict(r) for r in rows)
+                 if id_shape.match(n["id"])]
+    elif _kin_declared_audience(output_dir) == "private":
+        # Explicitly private index: the repo owner opted in to a full snapshot.
+        rows = store.conn.execute(
+            "SELECT * FROM nodes ORDER BY id ASC LIMIT ?",
+            (500,),
         ).fetchall()
         nodes = [store._row_to_dict(r) for r in rows]
     else:
-        nodes = store.all_nodes(limit=500)
+        rows = store.conn.execute(
+            "SELECT * FROM nodes WHERE audience IN ('public', 'team') "
+            "ORDER BY id ASC LIMIT ?",
+            (500,),
+        ).fetchall()
+        nodes = [store._row_to_dict(r) for r in rows]
 
+    # NB: no volatile timestamp here (e.g. source_updated_at). It would change on
+    # every regeneration, churning git history and conflicting on every concurrent
+    # merge; the commit time already records snapshot freshness. The file is a pure
+    # function of the node set so a structured union merge stays lossless.
     index = {
-        "version": 1,
-        "generated_at": _now_iso(),
-        "repo": repo_slug,
+        "domains": sorted(set(d for n in nodes for d in (n.get("domains") or []))),
         "node_count": len(nodes),
-        "nodes": [
-            {"id": n["id"], "title": n["title"], "type": n["type"],
-             "weight": n["weight"], "domains": n.get("domains", [])}
-            for n in nodes
-        ],
-        "domains": list(set(d for n in nodes for d in (n.get("domains") or []))),
+        "nodes": [_kin_index_node(n) for n in nodes],
+        "repo": repo_slug,
+        "version": 1,
     }
 
     output_path = output_dir / ".kin" / "index.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(index, indent=2) + "\n")
+    output_path.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
     return output_path

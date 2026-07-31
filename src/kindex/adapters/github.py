@@ -155,8 +155,9 @@ def ingest_commits(store: "Store", repo: str, since: str | None = None,
            "--jq", ".[].sha, .[].commit.message, .[].commit.author.name, .[].commit.author.date",
            "-q", f".[:{limit}]"]
 
-    # Use the proper API approach
-    cmd = ["gh", "api", f"repos/{repo}/commits?per_page={limit}"]
+    # Use the proper API approach. GitHub caps per_page at 100; larger
+    # values (e.g. an "unlimited" limit) must not be passed through.
+    cmd = ["gh", "api", f"repos/{repo}/commits?per_page={min(limit, 100)}"]
     if since:
         cmd[-1] += f"&since={since}"
 

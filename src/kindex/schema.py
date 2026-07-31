@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 # Audience scopes for tenancy model
 AUDIENCES = ("private", "team", "org", "public")
@@ -28,6 +28,41 @@ EDGE_TYPES = (
     "relates_to", "answers", "contradicts", "implements", "depends_on",
     "spawned_from", "supersedes", "exemplifies", "context_of", "blocks",
 )
+
+# Edit policy — how mutable each node type is via Store.edit_node:
+#   editable: free-form edits (title, content, tags, intent, aka, ...)
+#   additive: history matters — only append (addendum) and expires allowed;
+#             replacement goes through Store.supersede_node
+#   managed:  lifecycle owned by dedicated tooling (tasks/sessions/coordination);
+#             edit_node always refuses
+EDIT_POLICY: dict[str, tuple[str, ...]] = {
+    "editable": ("concept", "document", "artifact", "skill", "person",
+                 "project", "question"),
+    "additive": ("decision", "constraint", "directive", "checkpoint", "watch"),
+    "managed": ("task", "session", "coordination"),
+}
+
+
+def edit_class_for(node_type: str, overrides: dict[str, str] | None = None) -> str:
+    """Resolve the edit class for a node type.
+
+    Returns 'editable' | 'additive' | 'managed'. Unknown types default to
+    'editable'. `overrides` maps node_type -> class (from Config.edit_policy)
+    and wins over the built-in policy; an override naming an unknown class
+    raises ValueError so config typos surface instead of silently relaxing.
+    """
+    if overrides and node_type in overrides:
+        cls = overrides[node_type]
+        if cls not in EDIT_POLICY:
+            raise ValueError(
+                f"Unknown edit class '{cls}' for node type '{node_type}' "
+                f"(valid: {', '.join(EDIT_POLICY)})"
+            )
+        return cls
+    for cls, types in EDIT_POLICY.items():
+        if node_type in types:
+            return cls
+    return "editable"
 
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -132,6 +167,10 @@ CREATE TABLE IF NOT EXISTS suggestions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status);
+CREATE INDEX IF NOT EXISTS idx_suggestions_status_created
+    ON suggestions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_suggestions_status_pair
+    ON suggestions(status, concept_a, concept_b);
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS meta (
@@ -163,4 +202,25 @@ CREATE TABLE IF NOT EXISTS reminders (
 CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status);
 CREATE INDEX IF NOT EXISTS idx_reminders_next_due ON reminders(next_due);
 CREATE INDEX IF NOT EXISTS idx_reminders_priority ON reminders(priority);
+
+-- Stigmergic injection pheromone: a retrieval-ranking channel SEPARATE from
+-- edge.weight/node.weight (which drive graph topology). Tracks which nodes have
+-- proven useful WHEN INJECTED, learned across sessions. Deposited on injection,
+-- reinforced when the agent actually used the injection, decayed over time.
+-- context='' is the coarse global trail (warm-up); context=<project> are
+-- conditioned trails that self-resolve when the work regime changes.
+CREATE TABLE IF NOT EXISTS injection_pheromone (
+    node_id TEXT NOT NULL REFERENCES nodes(id),
+    context TEXT NOT NULL DEFAULT '',
+    strength REAL NOT NULL DEFAULT 0.0,
+    deposits INTEGER NOT NULL DEFAULT 0,
+    reinforcements INTEGER NOT NULL DEFAULT 0,
+    missed INTEGER NOT NULL DEFAULT 0,   -- counterfactual deposits: would-have-helped but wasn't injected
+    last_deposit TEXT NOT NULL DEFAULT (datetime('now')),
+    last_decay TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (node_id, context)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pheromone_node ON injection_pheromone(node_id);
+CREATE INDEX IF NOT EXISTS idx_pheromone_strength ON injection_pheromone(strength DESC);
 """

@@ -6,15 +6,16 @@ Extracts the structural skeleton and dependency graph of a codebase:
 - Edges: imports (depends_on), inheritance (implements), containment (context_of)
 
 Tools degrade gracefully:
-- Tier A: ctags only (baseline, always available)
+- Tier A: module indexing plus ctags symbols when available
 - Tier B: ctags + cscope (C/C++ cross-references)
-- Tier C: ctags + tree-sitter (AST-based call graphs, import resolution)
+- Tier C: ctags/tree-sitter (AST-based call graphs, import resolution)
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import tempfile
 from fnmatch import fnmatch
@@ -117,14 +118,90 @@ def _git_ls_files(repo_root: Path) -> list[Path]:
     return []
 
 
-# Source file extensions ctags handles well
-_CODE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".c", ".h",
-    ".cpp", ".hpp", ".cc", ".cxx", ".hh", ".java", ".rb", ".php",
-    ".cs", ".swift", ".kt", ".kts", ".scala", ".lua", ".zig",
-    ".ex", ".exs", ".erl", ".hrl", ".hs", ".ml", ".mli", ".r",
-    ".sh", ".bash", ".zsh", ".vim", ".el",
+# Source file extensions worth indexing even when ctags has no parser for them.
+_LANGUAGE_BY_EXTENSION = {
+    ".py": "Python",
+    ".js": "JavaScript",
+    ".mjs": "JavaScript",
+    ".cjs": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".mts": "TypeScript",
+    ".cts": "TypeScript",
+    ".astro": "Astro",
+    ".svelte": "Svelte",
+    ".vue": "Vue",
+    ".rs": "Rust",
+    ".go": "Go",
+    ".c": "C",
+    ".h": "C",
+    ".cpp": "C++",
+    ".hpp": "C++",
+    ".cc": "C++",
+    ".cxx": "C++",
+    ".hh": "C++",
+    ".java": "Java",
+    ".rb": "Ruby",
+    ".php": "PHP",
+    ".cs": "C#",
+    ".swift": "Swift",
+    ".kt": "Kotlin",
+    ".kts": "Kotlin",
+    ".scala": "Scala",
+    ".lua": "Lua",
+    ".zig": "Zig",
+    ".ex": "Elixir",
+    ".exs": "Elixir",
+    ".erl": "Erlang",
+    ".hrl": "Erlang",
+    ".hs": "Haskell",
+    ".ml": "OCaml",
+    ".mli": "OCaml",
+    ".r": "R",
+    ".sh": "Shell",
+    ".bash": "Shell",
+    ".zsh": "Shell",
+    ".vim": "Vim",
+    ".el": "Emacs Lisp",
 }
+
+_CODE_EXTENSIONS = set(_LANGUAGE_BY_EXTENSION)
+
+# Unity serialized-asset extensions — opt-in via code_ingest.unity in
+# .kin/config or `kin ingest code --unity` (issue #17). These are YAML
+# when the project uses text serialization, binary otherwise; content is
+# never parsed here, only sniffed (see _sniff_serialization).
+_UNITY_LANGUAGE_BY_EXTENSION = {
+    ".unity": "Unity Scene",
+    ".prefab": "Unity Prefab",
+    ".asset": "Unity Asset",
+    ".mat": "Unity Material",
+    ".controller": "Unity Animator",
+    ".anim": "Unity Animation",
+}
+
+# Unity build/cache output that must never be indexed. fnmatch's '*'
+# crosses path separators, so the '*/' variants catch nested Unity
+# projects (monorepo layouts) without matching e.g. Assets/MyLibrary/.
+_UNITY_EXCLUDES = [
+    "Library/*", "*/Library/*",
+    "Temp/*", "*/Temp/*",
+    "Logs/*", "*/Logs/*",
+    "obj/*", "*/obj/*",
+    "Build/*", "*/Build/*",
+    "UserSettings/*", "*/UserSettings/*",
+]
+
+# GUID line in a .meta sidecar, e.g. "guid: 0123456789abcdef0123456789abcdef"
+_UNITY_GUID_RE = re.compile(r"^guid:\s*([0-9a-fA-F]{32})\s*$", re.MULTILINE)
+
+# Universal Ctags supports TypeScript but does not map `.tsx` by default.
+_CTAGS_EXTENSION_MAPS = [
+    "--map-TypeScript=+.tsx",
+    "--map-TypeScript=+.mts",
+    "--map-TypeScript=+.cts",
+]
 
 _DEFAULT_EXCLUDES = [
     "test_*", "*_test.*", "*_test_*", "tests/*", "test/*",
@@ -133,13 +210,15 @@ _DEFAULT_EXCLUDES = [
 ]
 
 
-def _walk_files(root: Path, exclude: list[str]) -> list[Path]:
+def _walk_files(root: Path, exclude: list[str],
+                extensions: set[str] | None = None) -> list[Path]:
     """Walk directory tree, filtering by code extensions and exclude patterns."""
+    extensions = extensions or _CODE_EXTENSIONS
     files = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in _CODE_EXTENSIONS:
+        if path.suffix.lower() not in extensions:
             continue
         rel = str(path.relative_to(root))
         if any(fnmatch(rel, pat) for pat in exclude):
@@ -152,15 +231,17 @@ def _walk_files(root: Path, exclude: list[str]) -> list[Path]:
 
 
 def _get_file_list(directory: Path, repo_root: Path | None,
-                   exclude: list[str]) -> list[Path]:
+                   exclude: list[str],
+                   extensions: set[str] | None = None) -> list[Path]:
     """Get list of source files, preferring git ls-files."""
+    extensions = extensions or _CODE_EXTENSIONS
     if repo_root:
         all_files = _git_ls_files(repo_root)
         if all_files:
             # Filter to code files within the target directory, apply excludes
             result = []
             for f in all_files:
-                if not f.suffix.lower() in _CODE_EXTENSIONS:
+                if not f.suffix.lower() in extensions:
                     continue
                 try:
                     rel = str(f.relative_to(directory))
@@ -170,15 +251,32 @@ def _get_file_list(directory: Path, repo_root: Path | None,
                     continue
                 result.append(f)
             return sorted(result)
-    return _walk_files(directory, exclude)
+    return _walk_files(directory, exclude, extensions)
 
 
 # ── ctags extraction (Tier A) ──────────────────────────────────────
 
-def _run_ctags(files: list[Path], repo_root: Path) -> list[dict]:
-    """Run ctags on all files, return parsed JSON tags."""
-    if not files:
+def _parse_ctags_output(output: str | None) -> list[dict]:
+    """Parse any valid JSON tags from ctags output."""
+    if not output:
         return []
+    tags = []
+    for line in output.strip().split("\n"):
+        if not line:
+            continue
+        try:
+            tag = json.loads(line)
+            if tag.get("_type") == "tag":
+                tags.append(tag)
+        except json.JSONDecodeError:
+            continue
+    return tags
+
+
+def _run_ctags_once(files: list[Path], repo_root: Path) -> tuple[list[dict], bool]:
+    """Run ctags once, preserving usable output even when the command fails."""
+    if not files:
+        return [], False
     # Write file list to a temp file to avoid arg length limits
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
         for path in files:
@@ -190,38 +288,83 @@ def _run_ctags(files: list[Path], repo_root: Path) -> list[dict]:
                 "ctags",
                 "--output-format=json",
                 "--fields=+nKSlri",
+                *_CTAGS_EXTENSION_MAPS,
                 "-f", "-",
                 "-L", listfile,
             ],
             capture_output=True, text=True, timeout=120,
             cwd=str(repo_root),
         )
-        if r.returncode != 0:
-            return []
-        tags = []
-        for line in r.stdout.strip().split("\n"):
-            if not line:
-                continue
-            try:
-                tag = json.loads(line)
-                if tag.get("_type") == "tag":
-                    tags.append(tag)
-            except json.JSONDecodeError:
-                continue
-        return tags
+        return _parse_ctags_output(r.stdout), r.returncode != 0
     except Exception:
-        return []
+        return [], False
     finally:
         Path(listfile).unlink(missing_ok=True)
 
 
-def _group_by_file(tags: list[dict]) -> dict[str, list[dict]]:
-    """Group tags by file path."""
+def _canonical_path(path: str | Path, repo_root: Path | None = None) -> Path:
+    """Normalize a source path, resolving relative ctags paths from repo root."""
+    normalized = Path(path)
+    if not normalized.is_absolute() and repo_root:
+        normalized = repo_root / normalized
+    return normalized.resolve()
+
+
+def _tag_key(tag: dict) -> str:
+    """Build a stable dedupe key for ctags output."""
+    return json.dumps(tag, sort_keys=True, separators=(",", ":"))
+
+
+def _run_ctags(files: list[Path], repo_root: Path) -> list[dict]:
+    """Run ctags, preserving partial output and isolating failed files."""
+    tags, had_failure = _run_ctags_once(files, repo_root)
+    if had_failure and len(files) > 1:
+        tagged_paths = {
+            _canonical_path(tag["path"], repo_root)
+            for tag in tags
+            if tag.get("path")
+        }
+        for path in files:
+            if _canonical_path(path, repo_root) in tagged_paths:
+                continue
+            retry_tags, _ = _run_ctags_once([path], repo_root)
+            tags.extend(retry_tags)
+
+    deduped: dict[str, dict] = {}
+    for tag in tags:
+        deduped.setdefault(_tag_key(tag), tag)
+    return list(deduped.values())
+
+
+def _group_by_file(
+    tags: list[dict],
+    files: list[Path] | None = None,
+    repo_root: Path | None = None,
+) -> dict[str, list[dict]]:
+    """Group tags by file path, retaining source files with no tags."""
+    if files is None:
+        grouped: dict[str, list[dict]] = {}
+        for tag in tags:
+            path = tag.get("path", "")
+            if path:
+                grouped.setdefault(path, []).append(tag)
+        return grouped
+
     grouped: dict[str, list[dict]] = {}
+    known_paths: dict[Path, str] = {}
+    if files:
+        for path in files:
+            key = str(_canonical_path(path, repo_root))
+            grouped[key] = []
+            known_paths[_canonical_path(path, repo_root)] = key
+
     for tag in tags:
         path = tag.get("path", "")
         if path:
-            grouped.setdefault(path, []).append(tag)
+            normalized = _canonical_path(path, repo_root)
+            key = known_paths.get(normalized)
+            if key:
+                grouped[key].append(tag)
     return grouped
 
 
@@ -242,17 +385,77 @@ def _is_public(tag: dict) -> bool:
     return True
 
 
-def _build_module_content(rel_path: str, tags: list[dict]) -> str:
-    """Build structural summary for a module node."""
-    # Determine language from first tag
-    language = "Unknown"
-    for t in tags:
-        if t.get("language"):
-            language = t["language"]
-            break
+def _infer_language(path: Path, tags: list[dict],
+                    lang_by_ext: dict[str, str] | None = None) -> str:
+    """Prefer ctags language, then use the source extension as fallback."""
+    for tag in tags:
+        if tag.get("language"):
+            return tag["language"]
+    return (lang_by_ext or _LANGUAGE_BY_EXTENSION).get(path.suffix.lower(), "Unknown")
 
-    # Count lines from the last tag's line number (approximate)
-    max_line = max((t.get("line", 0) for t in tags), default=0)
+
+def _sniff_serialization(path: Path) -> str:
+    """Classify an asset file as text or binary serialization.
+
+    Unity text serialization always starts with a "%YAML 1.1" header;
+    binary assets contain NUL bytes early. Reads at most 64 bytes.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return "unreadable"
+    if head.startswith(b"%YAML"):
+        return "text"
+    return "binary" if b"\x00" in head else "text"
+
+
+def _unity_guid(path: Path) -> str:
+    """Read the asset GUID from a Unity .meta sidecar, if present.
+
+    Unity assets reference each other by GUID, not file name, so the
+    GUID is what lets models resolve cross-asset references.
+    """
+    meta = path.with_name(path.name + ".meta")
+    try:
+        if not meta.is_file():
+            return ""
+        match = _UNITY_GUID_RE.search(meta.read_text(errors="replace")[:2048])
+    except OSError:
+        return ""
+    return match.group(1).lower() if match else ""
+
+
+def _count_lines(path: Path) -> int:
+    """Count source lines without requiring text decoding.
+
+    Streams in chunks so huge files (e.g. multi-MB Unity scenes) never
+    get slurped into memory.
+    """
+    total = 0
+    last = b""
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                total += chunk.count(b"\n")
+                last = chunk
+    except OSError:
+        return 0
+    if not last:
+        return 0
+    return total + (not last.endswith(b"\n"))
+
+
+def _build_module_content(
+    rel_path: str,
+    tags: list[dict],
+    *,
+    language: str = "Unknown",
+    line_count: int = 0,
+) -> str:
+    """Build structural summary for a module node."""
+    # Count lines from the last tag's line number when no file count is known.
+    max_line = line_count or max((t.get("line", 0) for t in tags), default=0)
 
     # Collect classes
     classes = []
@@ -777,16 +980,41 @@ def ingest_code(
     store: "Store",
     directory: str | Path,
     *,
-    limit: int = 200,
+    limit: int | None = None,
     verbose: bool = False,
     exclude: list[str] | None = None,
+    unity: bool = False,
+    extra_extensions: dict[str, str] | None = None,
 ) -> IngestResult:
-    """Ingest code structure from a directory into the knowledge graph."""
+    """Ingest code structure from a directory into the knowledge graph.
+
+    Analysis is fully local (ctags/cscope/tree-sitter, no LLM calls), so
+    limit defaults to unlimited. None, 0, or negative all mean unlimited;
+    a positive limit caps created+updated nodes and reports truncation.
+
+    unity opts in to Unity serialized assets (.unity/.prefab/.asset/...)
+    with .meta GUID attachment; extra_extensions maps additional
+    extensions to language labels (".shader" -> "Unity Shader").
+    """
     directory = Path(directory).resolve()
     if not directory.is_dir():
         return IngestResult(errors=[f"Not a directory: {directory}"])
 
-    exclude_patterns = exclude or list(_DEFAULT_EXCLUDES)
+    if limit is not None and limit <= 0:
+        limit = None
+
+    exclude_patterns = list(exclude) if exclude else list(_DEFAULT_EXCLUDES)
+
+    lang_by_ext = dict(_LANGUAGE_BY_EXTENSION)
+    if unity:
+        lang_by_ext.update(_UNITY_LANGUAGE_BY_EXTENSION)
+        exclude_patterns.extend(_UNITY_EXCLUDES)
+    if extra_extensions:
+        lang_by_ext.update({
+            (ext if ext.startswith(".") else f".{ext}").lower(): label
+            for ext, label in extra_extensions.items()
+        })
+    extensions = set(lang_by_ext)
 
     # Detect repo
     repo_info = _detect_repo(directory)
@@ -798,28 +1026,34 @@ def ingest_code(
     # tree-sitter checked per-language later
 
     # Get file list
-    files = _get_file_list(directory, repo_root, exclude_patterns)
+    files = _get_file_list(directory, repo_root, exclude_patterns, extensions)
     if verbose:
         print(f"  Found {len(files)} source files in {directory}")
 
     if not files:
         return IngestResult()
 
-    # Run ctags on all files
+    # Run ctags on code files only — asset files added via unity/
+    # extra_extensions have no ctags parser, and feeding them in would
+    # make the per-file retry after a failed batch O(assets).
     effective_root = repo_root or directory
-    tags = _run_ctags(files, effective_root)
+    ctags_files = [f for f in files if f.suffix.lower() in _CODE_EXTENSIONS]
+    tags = _run_ctags(ctags_files, effective_root) if ctags_files else []
     if verbose:
         print(f"  ctags produced {len(tags)} tags")
 
-    if not tags:
-        return IngestResult(errors=["ctags produced no output"])
+    if not tags and verbose:
+        print("  ctags produced no tags; continuing with module fallback")
 
-    grouped = _group_by_file(tags)
+    grouped = _group_by_file(tags, files, effective_root)
 
     created = 0
     updated = 0
     skipped = 0
     errors: list[str] = []
+    warnings: list[str] = []
+    truncated = False
+    processed_files = 0
     all_node_ids: list[str] = []
 
     # Maps for edge creation: qualified_name -> node_id
@@ -828,9 +1062,6 @@ def ingest_code(
 
     # Phase 1: Create module and symbol nodes from ctags
     for abs_path_str, file_tags in grouped.items():
-        if created + updated >= limit:
-            break
-
         abs_path = Path(abs_path_str)
         try:
             rel_path = str(abs_path.relative_to(effective_root))
@@ -841,16 +1072,23 @@ def ingest_code(
         mod_id = _module_id(repo_slug, rel_path)
         module_node_ids[rel_path] = mod_id
 
-        # Check if file changed (incremental)
+        # Check if file changed (incremental). With unity, the GUID lives
+        # in a .meta sidecar outside the content hash, so a changed or
+        # newly-present GUID must also invalidate the skip.
         existing = store.get_node(mod_id)
         if existing:
-            old_hash = (existing.get("extra") or {}).get("file_hash", "")
+            old_extra = existing.get("extra") or {}
+            old_hash = old_extra.get("file_hash", "")
             try:
                 current_hash = _file_hash(abs_path)
             except OSError:
                 skipped += 1
                 continue
-            if old_hash == current_hash:
+            guid_unchanged = (
+                not unity
+                or old_extra.get("unity_guid", "") == _unity_guid(abs_path)
+            )
+            if old_hash == current_hash and guid_unchanged:
                 skipped += 1
                 # Still record symbol IDs for edge creation
                 for t in file_tags:
@@ -862,20 +1100,40 @@ def ingest_code(
                         symbol_node_ids[t["name"]] = sym_id  # short name too
                 continue
 
+        # Only files that actually mint/update nodes consume the budget;
+        # checking here (after the unchanged-skip) avoids a false
+        # truncation warning when everything left would have been skipped.
+        if limit is not None and created + updated >= limit:
+            truncated = True
+            break
+        processed_files += 1
+
         try:
             current_hash = _file_hash(abs_path)
         except OSError:
             errors.append(f"Cannot read: {rel_path}")
             continue
 
-        # Determine language
-        language = "Unknown"
-        for t in file_tags:
-            if t.get("language"):
-                language = t["language"]
-                break
+        # Determine language from ctags when possible, then from extension.
+        language = _infer_language(abs_path, file_tags, lang_by_ext)
+        language_source = (
+            "ctags"
+            if any(tag.get("language") for tag in file_tags)
+            else "extension"
+        )
+        # Asset files from unity/extra_extensions may be binary; sniff
+        # before reading (_count_lines slurps the whole file).
+        serialization = ""
+        if abs_path.suffix.lower() not in _CODE_EXTENSIONS:
+            serialization = _sniff_serialization(abs_path)
+        line_count = 0 if serialization == "binary" else _count_lines(abs_path)
 
-        content = _build_module_content(rel_path, file_tags)
+        content = _build_module_content(
+            rel_path,
+            file_tags,
+            language=language,
+            line_count=line_count,
+        )
 
         # Count classes and functions
         class_count = sum(1 for t in file_tags if t.get("kind") in _CLASS_KINDS)
@@ -886,12 +1144,20 @@ def ingest_code(
             "file_hash": current_hash,
             "relative_path": rel_path,
             "language": language,
-            "line_count": max((t.get("line", 0) for t in file_tags), default=0),
+            "language_source": language_source,
+            "ctags_tag_count": len(file_tags),
+            "line_count": line_count,
             "class_count": class_count,
             "function_count": func_count,
             "tool_tier": "A",
             "repo_root": str(effective_root),
         }
+        if serialization:
+            extra["serialization"] = serialization
+        if unity:
+            guid = _unity_guid(abs_path)
+            if guid:
+                extra["unity_guid"] = guid
 
         title = rel_path  # Use relative path as title — most useful for search
 
@@ -917,12 +1183,15 @@ def ingest_code(
 
         # --- Symbol nodes (Tier 2) — classes/interfaces/types ---
         for t in file_tags:
-            if created + updated >= limit:
-                break
             if t.get("kind") not in _CLASS_KINDS:
                 continue
             if not _is_public(t):
                 continue
+            # Budget check after the filters, so tags that would never
+            # mint a node cannot trigger a false truncation warning.
+            if limit is not None and created + updated >= limit:
+                truncated = True
+                break
 
             scope = t.get("scope", "")
             qname = f"{rel_path}:{scope}.{t['name']}" if scope else f"{rel_path}:{t['name']}"
@@ -1112,13 +1381,9 @@ def ingest_code(
     # Group files by language, try to load parser for each
     lang_files: dict[str, list[tuple[str, Path]]] = {}
     for abs_path_str, file_tags in grouped.items():
-        language = "Unknown"
-        for t in file_tags:
-            if t.get("language"):
-                language = t["language"]
-                break
+        abs_path = Path(abs_path_str)
+        language = _infer_language(abs_path, file_tags, lang_by_ext)
         if language != "Unknown":
-            abs_path = Path(abs_path_str)
             try:
                 rel_path = str(abs_path.relative_to(effective_root))
             except ValueError:
@@ -1266,10 +1531,47 @@ def ingest_code(
     # Link all code nodes to project
     _link_to_project(store, repo_slug, all_node_ids)
 
-    return IngestResult(created=created, updated=updated, skipped=skipped, errors=errors)
+    if truncated:
+        msg = (f"limit {limit} reached after {processed_files} of "
+               f"{len(grouped)} files; pass --limit 0 to ingest everything")
+        if verbose:
+            print(f"  Warning: {msg}")
+        warnings.append(msg)
+
+    return IngestResult(created=created, updated=updated, skipped=skipped,
+                        errors=errors, warnings=warnings)
 
 
 # ── Adapter protocol wrapper ───────────────────────────────────────
+
+def _target_code_ingest(directory: str):
+    """Read the TARGET repo's own .kin/config code_ingest section.
+
+    The project-scoped Unity opt-in should follow the directory being
+    ingested, not whatever project the caller's cwd resolves to. Reads
+    only the target's git-tracked .kin/config (checked at the directory
+    itself, then at its git root) — no global config layering, so tests
+    and cross-project ingests stay hermetic. Returns None when absent.
+    """
+    try:
+        import yaml
+
+        from ..config import CodeIngestConfig
+
+        d = Path(directory).resolve()
+        repo = _detect_repo(d)
+        candidates = [d] + ([repo[0]] if repo else [])
+        for root in dict.fromkeys(candidates):
+            f = Path(root) / ".kin" / "config"
+            if f.is_file():
+                data = yaml.safe_load(f.read_text()) or {}
+                section = data.get("code_ingest") if isinstance(data, dict) else None
+                if isinstance(section, dict):
+                    return CodeIngestConfig(**section)
+    except Exception:
+        pass
+    return None
+
 
 class CodeAdapter:
     meta = AdapterMeta(
@@ -1278,13 +1580,15 @@ class CodeAdapter:
         options=[
             AdapterOption("directory", "Repository or directory to analyze", required=True),
             AdapterOption("exclude", "Comma-separated exclude glob patterns"),
+            AdapterOption("unity", "Include Unity asset files (.unity/.prefab/.asset) "
+                                   "and .meta GUIDs"),
         ],
     )
 
     def is_available(self) -> bool:
         return _check_ctags()
 
-    def ingest(self, store: "Store", *, limit: int = 200, since: str | None = None,
+    def ingest(self, store: "Store", *, limit: int | None = None, since: str | None = None,
                verbose: bool = False, **kwargs: Any) -> IngestResult:
         directory = kwargs.get("directory")
         if not directory:
@@ -1295,9 +1599,20 @@ class CodeAdapter:
         if exclude_str:
             exclude = [p.strip() for p in exclude_str.split(",") if p.strip()]
 
+        # Unity opt-in: explicit --unity flag wins; otherwise the TARGET
+        # directory's own .kin/config code_ingest section (the project
+        # being ingested, not the cwd), falling back to the loaded config.
+        code_ingest = (_target_code_ingest(directory)
+                       or getattr(kwargs.get("_config"), "code_ingest", None))
+        unity = kwargs.get("unity")
+        if unity is None:
+            unity = bool(code_ingest and code_ingest.unity)
+        extra_extensions = dict(code_ingest.include_extensions) if code_ingest else None
+
         return ingest_code(
             store, directory,
             limit=limit, verbose=verbose, exclude=exclude,
+            unity=unity, extra_extensions=extra_extensions,
         )
 
 

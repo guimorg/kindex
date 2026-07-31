@@ -227,6 +227,69 @@ class TestDreamLightweight:
         titles = [n["title"] for n in nodes]
         assert titles.count("Duplicate concept here") == 2
 
+    def test_dedupes_existing_suggestion_outside_recent_window(
+        self,
+        config,
+        store,
+        monkeypatch,
+    ):
+        import kindex.dream as dream
+
+        a = store.add_node("Alpha anchor")
+        b = store.add_node("Zeta unrelated bridge")
+        sid = store.add_suggestion(a, b, reason="old duplicate", source="test")
+        store.conn.execute(
+            "UPDATE suggestions SET created_at = '2000-01-01 00:00:00' WHERE id = ?",
+            (sid,),
+        )
+        store.conn.commit()
+        for i in range(250):
+            store.add_suggestion(f"new-{i}", f"other-{i}", reason="newer filler")
+
+        monkeypatch.setattr(
+            dream,
+            "find_duplicates",
+            lambda _store: {"merge": [], "suggest": [(a, b, 0.9)]},
+        )
+
+        results = dream.dream_lightweight(config, store)
+        row = store.conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM suggestions
+             WHERE (concept_a = ? AND concept_b = ?)
+                OR (concept_a = ? AND concept_b = ?)
+            """,
+            (a, b, b, a),
+        ).fetchone()
+
+        assert results["suggested"] == 0
+        assert results["suggestion_existing"] == 1
+        assert row["count"] == 1
+
+    def test_caps_new_suggestion_writes(self, config, store, monkeypatch):
+        import kindex.dream as dream
+
+        config.reminders.dream_max_new_suggestions = 2
+        monkeypatch.setattr(
+            dream,
+            "find_duplicates",
+            lambda _store: {
+                "merge": [],
+                "suggest": [
+                    ("a1", "b1", 0.9),
+                    ("a2", "b2", 0.9),
+                    ("a3", "b3", 0.9),
+                ],
+            },
+        )
+
+        results = dream.dream_lightweight(config, store)
+
+        assert results["suggested"] == 2
+        assert results["suggestion_candidates"] == 3
+        assert results["suggestion_cap"] == 2
+        assert results["suggestion_capped"] is True
+
 
 class TestDreamFull:
     def test_runs_on_empty_store(self, config, store):
@@ -248,6 +311,8 @@ class TestDreamCycle:
 
         last = s.get_meta("last_dream_run")
         assert last is not None
+        started = s.get_meta("last_dream_started")
+        assert started is not None
 
         s.close()
 
@@ -272,6 +337,55 @@ class TestDreamCycle:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
         s.close()
+
+    def test_detach_dream_throttles_recent_spawn(self, tmp_path, monkeypatch):
+        from kindex.dream import detach_dream
+
+        class FakeProc:
+            pid = 12345
+
+        calls = []
+
+        def fake_popen(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc()
+
+        cfg = Config(data_dir=str(tmp_path))
+        cfg.reminders.dream_min_interval = 3600
+        monkeypatch.setattr("kindex.setup._find_kin_path", lambda: "/tmp/kin")
+        monkeypatch.setattr("kindex.dream.subprocess.Popen", fake_popen)
+
+        first = detach_dream(cfg, mode="lightweight")
+        second = detach_dream(cfg, mode="lightweight")
+
+        assert first["detached"] is True
+        assert first["pid"] == 12345
+        assert second["detached"] is False
+        assert second["skipped"] == "recent"
+        assert len(calls) == 1
+
+    def test_detach_dream_force_bypasses_throttle(self, tmp_path, monkeypatch):
+        from kindex.dream import detach_dream
+
+        class FakeProc:
+            pid = 12345
+
+        calls = []
+
+        def fake_popen(cmd, **kwargs):
+            calls.append(cmd)
+            return FakeProc()
+
+        cfg = Config(data_dir=str(tmp_path))
+        cfg.reminders.dream_min_interval = 3600
+        monkeypatch.setattr("kindex.setup._find_kin_path", lambda: "/tmp/kin")
+        monkeypatch.setattr("kindex.dream.subprocess.Popen", fake_popen)
+
+        detach_dream(cfg, mode="lightweight")
+        forced = detach_dream(cfg, mode="lightweight", force=True)
+
+        assert forced["detached"] is True
+        assert len(calls) == 2
 
 
 class TestDreamIdempotent:
@@ -357,3 +471,77 @@ class TestDomainEdges:
 
         created = strengthen_domain_edges(store)
         assert created == 0
+
+
+# ── Protected types: managed/additive state survives dream (idx 25) ──
+
+
+class TestDreamProtectsManagedState:
+    def test_protected_types_derive_from_edit_policy(self):
+        """PROTECTED_TYPES is the schema EDIT_POLICY additive+managed union."""
+        from kindex.dream import PROTECTED_TYPES
+        from kindex.schema import EDIT_POLICY
+
+        expected = frozenset(EDIT_POLICY["additive"]) | frozenset(
+            EDIT_POLICY["managed"])
+        assert PROTECTED_TYPES == expected
+        # The managed class — the original gap — is explicitly covered.
+        assert {"coordination", "task", "session"} <= PROTECTED_TYPES
+
+    def test_near_identical_coordination_slugs_survive_dream(self, config, store):
+        """Repro: 'sprint-14-planning' vs 'sprint-15-planning' share identical
+        content, so pre-fix dream_lightweight auto-merged one mid-collab,
+        destroying members/cursors/messages and breaking get_conversation."""
+        from kindex.coordination import (
+            create_conversation,
+            get_conversation,
+            join_conversation,
+            post_message,
+        )
+        from kindex.dream import dream_lightweight
+
+        create_conversation(store, "sprint-14-planning", created_by="agent-a")
+        create_conversation(store, "sprint-15-planning", created_by="agent-b")
+        join_conversation(store, "sprint-14-planning", "agent-b")
+        post_message(store, "sprint-14-planning", "agent-a", "claimed parser")
+
+        results = dream_lightweight(config, store)
+        assert results["merged"] == 0
+
+        for name in ("sprint-14-planning", "sprint-15-planning"):
+            conv = get_conversation(store, name)
+            assert conv is not None, f"{name} no longer resolvable"
+            assert conv["status"] == "active"
+            assert conv["extra"]["coord_status"] == "active"
+        extra = get_conversation(store, "sprint-14-planning")["extra"]
+        assert [m["agent"] for m in extra["members"]] == ["agent-a", "agent-b"]
+        assert len(extra["messages"]) == 1
+
+    def test_merge_nodes_refuses_protected_types(self, store):
+        """Defense in depth: merge_nodes itself refuses protected types."""
+        from kindex.dream import merge_nodes
+
+        a = store.add_node("Task one alpha", node_type="task",
+                           extra={"task_status": "open"})
+        b = store.add_node("Task one alpha2", node_type="task",
+                           extra={"task_status": "open"})
+        c = store.add_node("Plain concept", node_type="concept")
+
+        assert merge_nodes(store, a, b) is False
+        assert merge_nodes(store, c, a) is False  # protected target too
+        assert store.get_node(a)["status"] == "active"
+        assert store.get_node(a)["extra"]["task_status"] == "open"
+
+    def test_merge_preserves_source_extra(self, store):
+        """Archiving a merged source annotates extra instead of replacing it."""
+        from kindex.dream import merge_nodes
+
+        a = store.add_node("Source w extra", content="S",
+                           extra={"custom_key": "keepme"})
+        b = store.add_node("Target node x", content="T")
+
+        assert merge_nodes(store, a, b) is True
+        extra = store.get_node(a)["extra"]
+        assert extra["custom_key"] == "keepme"
+        assert extra["merged_into"] == b
+        assert extra["merged_by"] == "dream-cycle"

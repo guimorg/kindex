@@ -16,7 +16,10 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import datetime
+from functools import partial
 from typing import TYPE_CHECKING
+
+from .agent_adapters import adapter_scoped_out
 
 if TYPE_CHECKING:
     from .store import Store
@@ -179,6 +182,31 @@ def _node_weight_scores(store: Store, node_ids: set[str]) -> list[tuple[str, flo
     return results
 
 
+def _learned_pheromone_weight(store: Store) -> float:
+    """Auto-ramped pheromone ranking weight from the maturity gate (0 if immature)."""
+    try:
+        from .reinforce import learned_pheromone_weight
+        return learned_pheromone_weight(store)
+    except Exception:
+        return 0.0
+
+
+def _pheromone_scores(store: Store, node_ids: set[str]) -> list[tuple[str, float]]:
+    """Decayed injection-usefulness pheromone per node, conditioned on project."""
+    acfg = getattr(store.config, "attention", None)
+    half_life = getattr(acfg, "pheromone_half_life_days", 14.0)
+    min_deposits = getattr(acfg, "pheromone_min_deposits", 5)
+    project_path = getattr(store.config, "_project_path", None)
+    context = ""
+    if project_path:
+        import os
+        context = os.path.basename(str(project_path).rstrip("/")) or ""
+    return store.pheromone_scores(
+        node_ids, context=context,
+        half_life_days=half_life, min_deposits=min_deposits,
+    )
+
+
 def _weighted_ensemble(
     sources: dict[str, list[tuple[str, float]]],
     weights: dict[str, float] | None = None,
@@ -225,6 +253,8 @@ def hybrid_search(
     expand_graph: bool = True,
     graph_hops: int = 1,
     ranking: str = "ensemble",
+    *,
+    include_expired: bool = False,
 ) -> list[dict]:
     """Hybrid search combining FTS5 + graph expansion + vector search.
 
@@ -235,6 +265,10 @@ def hybrid_search(
 
     Args:
         ranking: 'ensemble' (weighted, with confidence) or 'rrf' (legacy).
+        include_expired: When False (default), nodes whose extra['expires']
+            is in the past are filtered out — expired knowledge stops
+            surfacing in search/context/ask everywhere, matching the primed
+            session context. Daemon/maintenance callers may opt in.
 
     Returns list of node dicts with 'confidence' and 'rrf_score' keys.
     """
@@ -296,6 +330,15 @@ def hybrid_search(
         if all_ids:
             sources["node_weight"] = _node_weight_scores(store, all_ids)
             sources["recency"] = _recency_score(store, all_ids)
+            # Stigmergic injection-usefulness — separate channel from topology.
+            # Weight is the user's explicit override (ranking.pheromone_weight>0)
+            # else the auto-ramped learned weight (0 until trails mature).
+            phero_weight = cfg_weights.get("pheromone", 0) or _learned_pheromone_weight(store)
+            if phero_weight > 0:
+                phero = _pheromone_scores(store, all_ids)
+                if phero:
+                    sources["pheromone"] = phero
+                    cfg_weights = {**cfg_weights, "pheromone": phero_weight}
 
         merged = _weighted_ensemble(sources, weights=cfg_weights)
     else:
@@ -307,15 +350,36 @@ def hybrid_search(
             ranked_lists.append(vec_ranked)
         merged = _rrf_merge(*ranked_lists, k=cfg_rrf_k) if len(ranked_lists) > 1 else fts_ranked
 
-    # Fetch full nodes for top results
+    # Fetch full nodes for top results. Superseded nodes never surface —
+    # follow extra['superseded_by'] to the live replacement when it isn't
+    # already a candidate of its own, otherwise drop the stale entry.
+    from .store import node_expired
+
+    top = merged[:top_k]
+    top_ids = {nid for nid, _ in top}
     results = []
-    for nid, score in merged[:top_k]:
+    seen: set[str] = set()
+    for nid, score in top:
         node = store.get_node(nid)
-        if node:
-            node["confidence"] = round(score, 4)
-            node["rrf_score"] = round(score, 6)  # backward compat
-            node["edges_out"] = store.edges_from(nid)[:5]
-            results.append(node)
+        hops = 0
+        while node is not None and node.get("status") == "superseded":
+            successor = (node.get("extra") or {}).get("superseded_by")
+            if not successor or successor in top_ids or hops >= 5:
+                node = None
+                break
+            node = store.get_node(successor)
+            hops += 1
+        if node is None or node.get("status") == "superseded":
+            continue
+        if not include_expired and node_expired(node):
+            continue
+        if node["id"] in seen:
+            continue
+        seen.add(node["id"])
+        node["confidence"] = round(score, 4)
+        node["rrf_score"] = round(score, 6)  # backward compat
+        node["edges_out"] = store.edges_from(node["id"])[:5]
+        results.append(node)
 
     return results
 
@@ -353,6 +417,7 @@ def format_context_block(
     query: str = "",
     level: str | None = None,
     max_tokens_approx: int | None = None,
+    adapter: str | None = None,
 ) -> str:
     """Format search results as a context block for CLAUDE.md injection.
 
@@ -360,6 +425,10 @@ def format_context_block(
     Auto-selects tier based on max_tokens_approx if level is not specified.
     Enforces token budget: if output exceeds the tier budget, progressively
     drops results until it fits.
+
+    When ``adapter`` names a client, operational nodes scoped to a different
+    client are dropped from the full/abridged tiers; with no adapter every node
+    surfaces (the right default for human-facing ``kin context``).
     """
     if not results:
         return "## Kindex: No relevant context found.\n"
@@ -368,7 +437,7 @@ def format_context_block(
         level = auto_select_tier(max_tokens_approx)
 
     budget = max_tokens_approx or TIER_BUDGETS.get(level, 1500)
-    formatter = _TIER_FORMATTERS.get(level, _format_abridged)
+    formatter = partial(_TIER_FORMATTERS.get(level, _format_abridged), adapter=adapter)
 
     # Try with all results, then progressively trim until within budget
     for n in range(len(results), 0, -1):
@@ -392,9 +461,22 @@ def _gather_domains(results: list[dict]) -> set[str]:
     return domains
 
 
-def _append_operational(store: Store, lines: list[str], verbose: bool = False) -> None:
-    """Append active operational nodes (constraints, watches, etc.) to output."""
+def _append_operational(
+    store: Store, lines: list[str], verbose: bool = False, adapter: str | None = None
+) -> None:
+    """Append active operational nodes (constraints, watches, etc.) to output.
+
+    When ``adapter`` names a client, nodes scoped to a different client (e.g. an
+    Antigravity hook-protocol directive) are dropped, mirroring the attention and
+    prime injection paths. With no adapter, every operational node surfaces — the
+    right default for human-facing ``kin context``/``kin status``.
+    """
     ops = store.operational_summary()
+    if adapter is not None:
+        ops = {
+            k: [n for n in v if not adapter_scoped_out(n.get("tags"), adapter)]
+            for k, v in ops.items()
+        }
 
     if ops["constraints"]:
         lines.append("\n### Active constraints")
@@ -431,7 +513,9 @@ def _append_operational(store: Store, lines: list[str], verbose: bool = False) -
 
 # ── Full tier ─────────────────────────────────────────────────────────
 
-def _format_full(store: Store, results: list[dict], query: str) -> str:
+def _format_full(
+    store: Store, results: list[dict], query: str, adapter: str | None = None
+) -> str:
     """Full context — everything Kindex knows about the active domain."""
     all_domains = _gather_domains(results)
 
@@ -495,14 +579,16 @@ def _format_full(store: Store, results: list[dict], query: str) -> str:
                 lines.append(f"  Rationale: {_strip_frontmatter(d['content'])[:200]}")
 
     # Operational nodes
-    _append_operational(store, lines, verbose=True)
+    _append_operational(store, lines, verbose=True, adapter=adapter)
 
     return "\n".join(lines) + "\n"
 
 
 # ── Abridged tier ─────────────────────────────────────────────────────
 
-def _format_abridged(store: Store, results: list[dict], query: str) -> str:
+def _format_abridged(
+    store: Store, results: list[dict], query: str, adapter: str | None = None
+) -> str:
     """Abridged — key nodes, trimmed content, edges preserved."""
     all_domains = _gather_domains(results)
 
@@ -552,14 +638,16 @@ def _format_abridged(store: Store, results: list[dict], query: str) -> str:
             lines.append(f"- {when}: {d['title']}")
 
     # Active constraints and watches (brief)
-    _append_operational(store, lines, verbose=False)
+    _append_operational(store, lines, verbose=False, adapter=adapter)
 
     return "\n".join(lines) + "\n"
 
 
 # ── Summarized tier ───────────────────────────────────────────────────
 
-def _format_summarized(store: Store, results: list[dict], query: str) -> str:
+def _format_summarized(
+    store: Store, results: list[dict], query: str, adapter: str | None = None
+) -> str:
     """Summarized — paragraph-form narrative per domain cluster."""
     all_domains = _gather_domains(results)
 
@@ -599,7 +687,9 @@ def _format_summarized(store: Store, results: list[dict], query: str) -> str:
 
 # ── Executive tier ────────────────────────────────────────────────────
 
-def _format_executive(store: Store, results: list[dict], query: str) -> str:
+def _format_executive(
+    store: Store, results: list[dict], query: str, adapter: str | None = None
+) -> str:
     """Executive — 2-3 sentences per active thread. Minimum to orient."""
     all_domains = _gather_domains(results)
     domain_str = ", ".join(sorted(all_domains)[:4])
@@ -625,7 +715,9 @@ def _format_executive(store: Store, results: list[dict], query: str) -> str:
 
 # ── Index tier ────────────────────────────────────────────────────────
 
-def _format_index(store: Store, results: list[dict], query: str) -> str:
+def _format_index(
+    store: Store, results: list[dict], query: str, adapter: str | None = None
+) -> str:
     """Index — node titles and edge types only. Just the map."""
     titles = []
     for r in results:

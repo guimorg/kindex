@@ -19,8 +19,14 @@ if TYPE_CHECKING:
     from .budget import BudgetLedger
 
 
-def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
-                  config: Config | None = None) -> str:
+def prime_context(
+    store: Store,
+    topic: str | None = None,
+    max_tokens: int = 750,
+    config: Config | None = None,
+    conversation_id: str | None = None,
+    adapter: str | None = None,
+) -> str:
     """Generate compact context injection (~500-750 tokens) for SessionStart hook.
 
     - Auto-detects topic from current working directory if not provided
@@ -31,7 +37,9 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
 
     Returns a string suitable for CLAUDE.md injection.
     """
+    from .agent_adapters import adapter_scoped_out
     from .retrieve import detect_domain_from_path, hybrid_search
+    from .store import node_expired
 
     # Auto-detect topic from cwd if not provided
     if not topic:
@@ -43,8 +51,9 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
             # Use the directory name as a fallback search term
             topic = os.path.basename(cwd)
 
-    # Search for relevant nodes
-    results = hybrid_search(store, topic, top_k=8)
+    # Search for relevant nodes (expired and other-client nodes never surface)
+    results = [r for r in hybrid_search(store, topic, top_k=8)
+               if not node_expired(r) and not adapter_scoped_out(r.get("tags"), adapter)]
 
     lines: list[str] = []
     lines.append("## Kindex Context (auto-primed)")
@@ -77,8 +86,17 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
 
         lines.append("")
 
-    # -- Active operational nodes --
+    # -- Active operational nodes (expired ones are skipped in every section) --
+    # Client-scoped nodes (e.g. an Antigravity hook-protocol directive) are dropped
+    # when a different client is priming, mirroring the attention-hook scoping.
     ops = store.operational_summary()
+    ops = {
+        k: [
+            n for n in v
+            if not node_expired(n) and not adapter_scoped_out(n.get("tags"), adapter)
+        ]
+        for k, v in ops.items()
+    }
 
     if ops["constraints"]:
         lines.append("### Active constraints")
@@ -133,15 +151,25 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
     recent = store.activity_since(yesterday)
     if recent:
         lines.append("### Recent activity (last 24h)")
-        # Group by action
+        # Group by action. Notable titles for nodes scoped to a different client
+        # are dropped so their titles don't echo into the wrong session (the
+        # aggregate counts stay complete — they reveal no titles).
+        scoping = bool(adapter) and adapter != "plain"
         action_counts: dict[str, int] = {}
         notable: list[str] = []
         for entry in recent:
             action = entry.get("action", "unknown")
             action_counts[action] = action_counts.get(action, 0) + 1
+            if len(notable) >= 5:
+                continue
             target = entry.get("target_title") or entry.get("target_id", "")
-            if target and len(notable) < 5:
-                notable.append(f"{action}: {target}")
+            if not target:
+                continue
+            if scoping:
+                domains = store.get_node_domains(str(entry.get("target_id") or ""))
+                if adapter_scoped_out(domains, adapter):
+                    continue
+            notable.append(f"{action}: {target}")
 
         summary_parts = [f"{count} {action}" for action, count in action_counts.items()]
         lines.append(f"- Activity: {', '.join(summary_parts)}")
@@ -154,6 +182,8 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
         from .sessions import get_active_tag
 
         active_tag = get_active_tag(store, project_path=os.getcwd())
+        if active_tag and node_expired(active_tag):
+            active_tag = None
         if active_tag:
             extra = active_tag.get("extra") or {}
             tag_name = extra.get("tag", active_tag["title"])
@@ -176,15 +206,79 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
     except Exception:
         pass  # Don't break priming if sessions module has issues
 
+    # -- Active collabs (multi-agent coordination) --
+    try:
+        collab_cfg = config.collab if config else None
+        display = str(collab_cfg.display or "full").lower() if collab_cfg else "full"
+        if collab_cfg and collab_cfg.enabled and display != "quiet":
+            from .config import resolve_agent_id
+            from .coordination import active_collabs_for_agent
+
+            collabs = active_collabs_for_agent(store, resolve_agent_id(config))
+            if collabs:
+                lines.append("### Active collabs")
+                for c in collabs[:3]:
+                    name = c.get("name", "")
+                    unread = int(c.get("unread_count", 0) or 0)
+                    injects = c.get("inject_messages") or []
+                    locked = c.get("locked_resources") or []
+                    focus = (c.get("focus") or "")[:80]
+
+                    if display == "minimal":
+                        parts = [f"{unread} unread"]
+                        if injects:
+                            parts.append(f"{len(injects)} standing msg")
+                        if locked:
+                            parts.append(f"{len(locked)} locked")
+                        lines.append(
+                            f"- {name}: {', '.join(parts)} — coord_read {name}"
+                        )
+                        continue
+
+                    head = f"- **{name}** — {unread} unread"
+                    if focus:
+                        head += f" (focus: {focus})"
+                    lines.append(head)
+                    for m in injects[:3]:
+                        text = " ".join(str(m.get("text", "")).split())[:200]
+                        set_by = (m.get("set_by") or "").strip()
+                        who = f" (from {set_by})" if set_by else ""
+                        lines.append(f"  COLLAB MSG: {text}{who}")
+                    for r in locked[:3]:
+                        lines.append(
+                            f"  Locked: {r.get('title') or r.get('node_id', '')} "
+                            f"(held by {r.get('holder', '')})"
+                        )
+                    lines.append(f"  Check the collab: coord_read {name}")
+                if len(collabs) > 3:
+                    lines.append(f"- +{len(collabs) - 3} more")
+                lines.append("")
+    except Exception:
+        pass  # Don't break priming
+
     # -- Due/upcoming reminders --
     try:
         if config and config.reminders.enabled:
+            from .reminders import filter_reminders_for_conversation, scoped_due_reminders
             upcoming_window = datetime.datetime.now() + datetime.timedelta(hours=1)
             upcoming_iso = upcoming_window.isoformat(timespec="seconds")
 
-            due_now = store.due_reminders()
-            upcoming = [r for r in store.list_reminders(status="active")
-                        if r["next_due"] <= upcoming_iso]
+            include_legacy = conversation_id is None
+            due_now = scoped_due_reminders(
+                store,
+                conversation_id,
+                include_global=True,
+                include_legacy=include_legacy,
+            )
+            upcoming = [
+                r for r in filter_reminders_for_conversation(
+                    store.list_reminders(status="active"),
+                    conversation_id,
+                    include_global=True,
+                    include_legacy=include_legacy,
+                )
+                if r["next_due"] <= upcoming_iso
+            ]
             due_ids = {d["id"] for d in due_now}
             all_reminders = due_now + [r for r in upcoming if r["id"] not in due_ids]
 
@@ -237,6 +331,8 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
             if gt["id"] not in seen_ids:
                 context_tasks.append(gt)
 
+        context_tasks = [t for t in context_tasks if not node_expired(t)]
+
         if context_tasks:
             lines.append("### Tasks")
             for t in context_tasks[:5]:
@@ -256,21 +352,25 @@ def prime_context(store: Store, topic: str | None = None, max_tokens: int = 750,
     except Exception:
         pass  # Don't break priming if tasks module has issues
 
-    # -- Session directives (always included) --
-    lines.append("### Session directives")
-    lines.append("You MUST use kindex MCP tools proactively — this is the user's external memory.")
-    lines.append("**Capture as you go** — don't batch, don't wait until the end:")
-    lines.append("- `search` FIRST to see what's known, and before every `add` to avoid duplicates")
-    lines.append("- `add` discoveries, decisions (--type decision), questions (--type question)")
-    lines.append("- `watch_add` for things needing monitoring (flaky tests, unstable APIs, pending items)")
-    lines.append("- `watch_resolve` when a watched issue is fixed or no longer relevant")
-    lines.append("- `link` aggressively — the graph's value is in connections, not isolated nodes")
-    lines.append("- `learn` after reading long files/outputs to bulk-extract knowledge")
-    lines.append("- `task_add` for work items — ALWAYS use link_to to connect to related concepts")
-    lines.append("- `task_done` to complete tasks, `task_list` to see what's open")
-    lines.append("- `remind_create` for time-based triggers (with `action` or `instructions`)")
-    lines.append("- `tag_start`/`tag_update` to track session focus and progress")
-    lines.append("")
+    # -- Session directives (gated by reminders.remind_kindex_usage) --
+    if config is None or config.reminders.remind_kindex_usage:
+        lines.append("### Session directives")
+        lines.append("You MUST use kindex MCP tools proactively — this is the user's external memory.")
+        lines.append("**Capture as you go** — don't batch, don't wait until the end:")
+        lines.append("- `search` FIRST to see what's known, and before every `add` to avoid duplicates")
+        lines.append("- `add` discoveries, decisions (--type decision), questions (--type question)")
+        lines.append("- `watch_add` for things needing monitoring (flaky tests, unstable APIs, pending items)")
+        lines.append("- `watch_resolve` when a watched issue is fixed or no longer relevant")
+        lines.append("- `link` aggressively — the graph's value is in connections, not isolated nodes")
+        lines.append("- `learn` after reading long files/outputs to bulk-extract knowledge")
+        lines.append("- `task_add` for work items — ALWAYS use link_to to connect to related concepts")
+        lines.append("- `task_done` to complete tasks, `task_list` to see what's open")
+        lines.append("- `remind_create` for time-based triggers (with `action`, `instructions`, or `wake`)")
+        lines.append("- `tag_start`/`tag_update` to track session focus and progress")
+        lines.append("**Project graph (`.kin/`)** — keep it with the code:")
+        lines.append("- Look for a `.kin/` directory in the tree of the files you touch — not just your cwd root — and honor its config/index.")
+        lines.append("- When you `git add`/commit, stage the matching `.kin/` changes (config, index.json) alongside the code so the graph travels with the work.")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -301,6 +401,10 @@ def capture_session_end(
 
     # Add extracted concepts
     for concept in extraction.get("concepts", []):
+        # Keyword fallback emits title-only concepts (useful for linking,
+        # not worth minting) — never create content-empty nodes here.
+        if not (concept.get("content") or "").strip():
+            continue
         if store.get_node_by_title(concept["title"]):
             continue
         nid = store.add_node(
@@ -469,7 +573,11 @@ def generate_session_directive(store: Store) -> str:
         "- Always `search` before `add` to avoid duplicates",
         "- Use `learn` for bulk extraction from long text/files",
         "- Use `tag_start`/`tag_update` to track session context",
-        "- Use `remind_create` with `action`/`instructions` for deferred tasks",
+        "- Use `remind_create` with `action`/`instructions`/`wake` for deferred tasks",
+        "",
+        "### Project graph (`.kin/`)",
+        "- Honor `.kin/` for the files you touch — look up the directory tree, not just the repo root.",
+        "- Stage and commit `.kin/` changes (config, index.json) together with the related code.",
         "",
     ]
 

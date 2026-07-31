@@ -2,77 +2,162 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![v0.18.0](https://img.shields.io/badge/version-0.18.0-purple.svg)](https://github.com/jmcentire/kindex/releases)
+[![v0.29.0](https://img.shields.io/badge/version-0.29.0-purple.svg)](https://github.com/jmcentire/kindex/releases)
 [![PyPI](https://img.shields.io/pypi/v/kindex.svg)](https://pypi.org/project/kindex/)
-[![Tests](https://img.shields.io/badge/tests-986%20passing-brightgreen.svg)](#)
+[![MCP Market](https://img.shields.io/badge/MCP%20Market-kindex-blue.svg)](https://mcpmarket.com/server/kindex)
+[![Tests](https://img.shields.io/badge/tests-1659%20passing-brightgreen.svg)](#)
 [![MCP Plugin](https://img.shields.io/badge/MCP-Plugin-orange.svg)](#install-as-agent-mcp-plugin)
 
 **The memory layer AI coding agents don't have.**
 
 Kindex does one thing. It knows what you know.
 
-It's a persistent knowledge graph for AI-assisted workflows. It indexes your conversations, projects, and intellectual work so that Claude Code, Codex, and other MCP-capable agents never start a session blind. Available as a **free MCP plugin** or standalone CLI.
+It's a persistent knowledge graph for AI-assisted workflows. It indexes your conversations, projects, and intellectual work so that Claude Code, Codex, Gemini CLI, Google Antigravity, OpenCode, Cursor, and other MCP-capable agents never start a session blind. Available as a **free MCP plugin** or standalone CLI.
 
 > **Memory plugins capture what happened. Kindex captures what it means and how it connects.** Most memory tools are session archives with search. Kindex is a weighted knowledge graph that grows intelligence over time — understanding relationships, surfacing constraints, and managing exactly how much context to inject based on your available token budget.
 
-## Install as Agent MCP Plugin
+Docs: [kindex.tools](https://kindex.tools/) is the canonical public site, served by the companion Fly static app. This repo also publishes its `docs/` directory at [jmcentire.github.io/kindex](https://jmcentire.github.io/kindex/). Human setup lives in [docs/human-guide.md](docs/human-guide.md); agent operating rules live in [docs/mcp-agent-guide.md](docs/mcp-agent-guide.md).
 
-### Claude Code
+## Install
 
-Two commands. Zero configuration.
+Pick whichever installer you already use. They all install the same `kin` and `kin-mcp` binaries.
 
 ```bash
-pip install kindex[mcp]
-claude mcp add --scope user --transport stdio kindex -- kin-mcp
+# pip
+pip install 'kindex[mcp]'
+
+# uv (single binary, no virtualenv)
+uv tool install 'kindex[mcp]'
+
+# uvx (no install — runs from cache, useful for one-off MCP invocation)
+uvx --from 'kindex[mcp]' kin-mcp --help
+
+# from source
+git clone https://github.com/jmcentire/kindex && cd kindex && make install
+```
+
+Then initialize the graph:
+
+```bash
 kin init
 ```
 
-Claude Code now has 30 native tools: `search`, `add`, `context`, `show`, `ask`, `learn`, `link`, `list_nodes`, `status`, `suggest`, `graph_stats`, `graph_merge`, `dream`, `changelog`, `ingest`, `tag_start`, `tag_update`, `tag_resume`, `remind_create`, `remind_list`, `remind_snooze`, `remind_done`, `remind_check`, `remind_exec`, `mode_activate`, `mode_list`, `mode_show`, `mode_create`, `mode_export`, `mode_import`, `mode_seed`.
+Extras — combine in one install (`'kindex[mcp,llm,reminders]'`) or use `'kindex[all]'`:
+
+| Extra | Adds |
+|-------|------|
+| `mcp` | `kin-mcp` MCP server (for Claude Code, Codex, Gemini, Antigravity, OpenCode, Cursor, etc.) |
+| `llm` | Anthropic-powered extraction (`kin learn`, `kin ask`) |
+| `vectors` | sqlite-vec for semantic similarity search |
+| `reminders` | Natural-language time parsing for `kin remind` |
+| `all` | Everything above |
+
+> Homebrew and apt packages aren't published yet. Use `pip`, `uv tool`, `uvx`, or source until they are.
+
+## Install as Agent MCP Plugin
+
+Each agent reads MCP servers from a different config file. The `kin setup-*-mcp` commands write the right shape into the right path; the manual snippet is shown alongside in case you'd rather edit the file yourself.
+
+### Claude Code
+
+```bash
+claude mcp add --scope user --transport stdio kindex -- kin-mcp
+kin init
+```
 
 Or add `.mcp.json` to any repo for project-scope access:
 ```json
 { "mcpServers": { "kindex": { "command": "kin-mcp" } } }
 ```
 
+The MCP server exposes 50+ native tools to supported clients: `search`, `add`, `context`, `show`, `ask`, `learn`, `link`, `edit`, `supersede`, `list_nodes`, `status`, `suggest`, `graph_stats`, `graph_merge`, `dream`, `changelog`, `ingest`, `tag_start`, `tag_update`, `tag_resume`, `task_claim`, `coord_*`, `lock_acquire`, `lock_release`, `remind_*`, `mode_*`, and more.
+
+For coding agents, install both the MCP server and the instruction file. The
+instruction file tells the model how to use kindex: start a session tag, read
+tracked `.kin/config`, check project policy, search before adding, capture
+durable decisions, and end the tag with a summary.
+
 ### Codex
 
 ```bash
-pip install kindex[mcp]
-kin init
 kin setup-codex-mcp
+kin setup-codex-hooks
+kin setup-agents-md --install --global
+kin ingest codex-sessions   # optional: backfill saved Codex sessions
+```
+
+`setup-codex-hooks` installs a **SessionStart** hook (alongside the prompt/tool attention hooks), so Codex begins each session with the same auto-primed context and "use kindex" / `.kin` directive as Claude Code.
+
+Or hand-edit `~/.codex/config.toml`:
+```toml
+[mcp_servers.kindex]
+command = "kin-mcp"
+```
+
+### Gemini CLI
+
+```bash
+kin setup-gemini-mcp
+kin setup-gemini-md --install
+```
+
+Or hand-edit `~/.gemini/settings.json`:
+```json
+{ "mcpServers": { "kindex": { "command": "kin-mcp", "args": [] } } }
+```
+
+### Google Antigravity
+
+```bash
+kin setup-antigravity-mcp
+kin setup-antigravity-hooks
+kin setup-antigravity-md --install
+```
+
+`setup-antigravity-mcp` writes the standalone MCP config shape used by
+Antigravity's editor/shared config and CLI config. `setup-antigravity-hooks`
+installs PreInvocation priming/prompt checks, PreToolUse advisory attention and
+permission gating for Kindex config writes, and Stop-time reinforcement enqueue.
+
+Or hand-edit `~/.gemini/config/mcp_config.json` and
+`~/.gemini/antigravity-cli/mcp_config.json`:
+```json
+{ "mcpServers": { "kindex": { "command": "kin-mcp", "args": [] } } }
+```
+
+### OpenCode
+
+```bash
+kin setup-opencode-mcp
 kin setup-agents-md --install --global
 ```
 
-This registers `kin-mcp` in `~/.codex/config.toml` and installs Codex-facing
-AGENTS.md directives that tell Codex to use kindex proactively.
-
-To backfill saved Codex sessions:
-
-```bash
-kin ingest codex-sessions
+Or hand-edit `~/.config/opencode/opencode.json`:
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "kindex": { "type": "local", "command": ["kin-mcp"], "enabled": true }
+  }
+}
 ```
 
-## Install as CLI
+OpenCode reads `AGENTS.md` natively, so install the MCP server and the shared `AGENTS.md` instructions together.
+OpenCode also supports plugins, but Kindex currently uses MCP + instructions there rather than prompt-time attention injection.
+
+### Cursor
 
 ```bash
-pip install kindex
-kin init
+kin setup-cursor-mcp
+kin setup-cursor-rules --install   # writes ~/.cursor/rules/kindex.mdc
 ```
 
-With LLM-powered extraction:
-```bash
-pip install kindex[llm]
+Or hand-edit `~/.cursor/mcp.json`:
+```json
+{ "mcpServers": { "kindex": { "type": "stdio", "command": "kin-mcp" } } }
 ```
 
-With reminders (natural language time parsing):
-```bash
-pip install kindex[reminders]
-```
-
-With everything (LLM + vectors + MCP + reminders):
-```bash
-pip install kindex[all]
-```
+Cursor integration is MCP + always-applied rules. Cursor rules provide prompt-level guidance, but Kindex does not currently install a Cursor prompt-submit hook because Cursor does not expose the same hook surface as Claude Code or Codex CLI.
 
 ## Why Kindex
 
@@ -135,18 +220,33 @@ Avg degree: 122.94
 Installing the MCP plugin gives the agent the tools. But agents won't use them proactively unless you tell them to. Kindex ships with recommended instruction blocks that turn passive tools into active habits. For the full agent playbook, see [docs/mcp-agent-guide.md](docs/mcp-agent-guide.md).
 
 ```bash
-# Claude Code: print or install the recommended directives
-kin setup-claude-md
+# Claude Code
 kin setup-claude-md --install
 
-# Codex: print or install AGENTS.md directives
-kin setup-agents-md
+# Codex (and OpenCode — both honor AGENTS.md)
 kin setup-agents-md --install --global
+
+# Gemini CLI
+kin setup-gemini-md --install
+
+# Google Antigravity
+kin setup-antigravity-md --install
+
+# Cursor — writes ~/.cursor/rules/kindex.mdc with alwaysApply: true
+kin setup-cursor-rules --install
 ```
 
 This adds session lifecycle rules (start/orient/during/segment/end), explicit capture triggers (discoveries, decisions, tasks, key files, notable outputs), and search-before-add discipline. The difference between "the agent has a knowledge graph" and "the agent actively maintains a knowledge graph" is this block.
 
-The SessionStart hook (`kin setup-hooks`) reinforces these directives at the start of every session with a "Session directives" block that reminds Claude to use kindex MCP tools throughout the session.
+For durable work, agents should use Kindex's persistent task and knowledge
+surfaces rather than host-session-only task state. Use `task_add`, `task_list`,
+and `task_done` for work that must survive the current conversation; search
+before adding knowledge; prefer `edit` or `supersede` over duplicate nodes; and
+treat tracked `.kin` files as shipped project state, not local cache.
+If the host also exposes session-local task tools, use those only for temporary
+planning; durable work belongs in Kindex.
+
+The Claude SessionStart hook (`kin setup-hooks`) and Codex hooks (`kin setup-codex-hooks`) reinforce these directives at the start of supported sessions with a "Session directives" block that reminds the agent to use kindex MCP tools throughout the session.
 
 ### What gets captured
 
@@ -156,11 +256,29 @@ With the directives active, the agent will:
 - **Link** related concepts when connections are found
 - **Learn** from long files and outputs via bulk extraction
 - **Tag** sessions to track work context across conversations
-- **Remind** with actions for deferred tasks (shell commands or headless Claude invocations)
+- **Remind** with actions for deferred tasks (shell commands or headless agent wakeups)
 
 ### Actionable Reminders
 
-Reminders can carry shell commands and/or natural-language instructions. When due, the daemon executes them automatically — simple commands run directly, complex tasks launch headless `claude -p`. A Stop hook guard blocks Claude from exiting when actionable reminders are pending.
+Reminders can carry shell commands, natural-language instructions, or a headless
+agent wakeup. When due, the daemon executes them automatically — simple commands
+run directly, complex Claude tasks launch `claude -p`, Codex wakeups run
+`codex exec`, and OpenCode wakeups run `opencode run`. Wakeups can resume a
+known host session id, or `last` for the latest session when the host supports
+that. This starts/resumes a headless turn from Kindex's daemon/cron context; it
+does not interrupt an idle TUI unless the host itself exposes a same-thread
+automation/server wake path. A Stop hook guard can block Claude from exiting when
+actionable reminders are pending, but it is opt-in because Claude displays
+visible "Blocked by hook" output when a Stop hook blocks.
+
+Important boundary: `remind_create` records the reminder. Something must later
+run `kin remind check`, `kin remind exec`, `kin cron`, or an installed
+`kin setup-cron` schedule for due reminders to fire. Wake reminders are a
+Kindex capability for Codex and OpenCode because those clients expose
+headless commands; they are not a reentrant scheduler for an already-idle
+interactive session.
+
+Hook-time reminder injection uses a scoped reminder board. When a client supplies a chat/session id (`conversation_id`, `chat_id`, `session_id`, `CLAUDE_SESSION_ID`, `CODEX_SESSION_ID`, `OPENCODE_SESSION_ID`, `CURSOR_SESSION_ID`, etc.), Kindex injects only reminders scoped to that id plus reminders explicitly marked `--scope global`. Legacy unscoped reminders still work for manual `kin prompt-check`, daemon checks, and notifications, but they are not injected into an identified chat by default.
 
 ```bash
 # Kill a cloud instance in 1 hour (but download results first)
@@ -168,13 +286,26 @@ kin remind create "Kill vast.ai instance" --at "in 1 hour" \
   --action "vastai destroy instance 12345" \
   --instructions "Download results from /workspace/ before killing"
 
+# Wake a headless Codex or OpenCode turn when due
+kin remind create "Continue rollout check" --at "in 10 minutes" \
+  --wake codex --session last --cwd "$PWD" \
+  --instructions "Check the rollout and fix any new failures."
+kin remind create "Continue OpenCode build" --at "in 10 minutes" \
+  --wake opencode --session last --cwd "$PWD" --wake-agent build \
+  --instructions "Continue the build triage."
+
+# Chat-scoped or intentionally global hook-visible reminders
+kin remind create "Deploy checklist" --at "tomorrow 9am" \
+  --conversation-id "$CLAUDE_SESSION_ID" --attention-trigger deploy
+kin remind create "Monthly billing review" --at "next Monday 9am" --scope global
+
 # Manual trigger
 kin remind exec --reminder-id <id>
 ```
 
 ### Dream — Knowledge Consolidation
 
-Kindex dreams. After each Claude Code session, a detached background process runs fuzzy deduplication, auto-applies pending suggestions, and strengthens edges between nodes that share domains. Like memory consolidation during sleep — replay, strengthen important paths, prune noise.
+Kindex can run fuzzy deduplication, auto-apply pending suggestions, and strengthen edges between nodes that share domains. Like memory consolidation during sleep — replay, strengthen important paths, prune noise.
 
 ```bash
 # See what would happen (no changes)
@@ -189,11 +320,11 @@ kin dream --lightweight
 # Include LLM-powered cluster summarisation
 kin dream --deep
 
-# Fork and return immediately (used by Stop hook)
+# Fork and return immediately; repeated detached starts are throttled
 kin dream --detach --lightweight
 ```
 
-Three triggers: manual CLI, periodic cron (step 11 of `kin cron`), and automatic detached subprocess on Claude Code session exit. File locking prevents concurrent cycles. The detached process uses `start_new_session=True` to survive Claude Code's exit.
+Default triggers are manual CLI, periodic cron (step 11 of `kin cron`), and a throttled detached Stop hook. File locking prevents concurrent cycles, and `reminders.dream_min_interval` prevents hooks or cron from relaunching dream repeatedly after a recent start. Set `reminders.dream_on_stop_enabled: false` to disable Stop-time detached dream while leaving manual and cron dream available.
 
 ### Conversation Modes
 
@@ -266,6 +397,130 @@ kin remind snooze --reminder-id <id> --duration 1h
 kin remind done --reminder-id <id>
 ```
 
+## Editing & Superseding
+
+Knowledge changes. Kindex edits are policy-aware: each node type has a mutability class that says how its content may change, so facts stay correctable while history-bearing records stay append-only.
+
+| Class | Node types | What's allowed |
+|-------|-----------|----------------|
+| `editable` | concept, document, artifact, skill, person, project, question | Full in-place edit: title, content, append, tags, intent, expires |
+| `additive` | decision, constraint, directive, checkpoint, watch | History matters — append and expires only; use `supersede` to replace |
+| `managed` | task, session, coordination | Refused — use the dedicated `task`/`tag`/`coord` commands |
+
+```bash
+# In-place edit (editable types) — accepts node id or exact title
+kin edit oauth-flow --title "OAuth2 + OIDC flow" --add-tags auth,oidc
+
+# Additive types only grow: append a dated addendum
+kin edit deploy-constraint --append "Clarified: applies to staging too"
+
+# Give any node an expiry — expired nodes stop surfacing and get archived
+kin edit conference-notes --expires 2026-09-01
+
+# Replace with history: new node + supersedes edge, old node marked superseded
+kin supersede old-decision "We now use OIDC trusted publishing" --reason "tokens deprecated"
+```
+
+Every edit logs per-field value diffs to the activity log, and `kin changelog` renders them:
+
+```
+## Edited (1 nodes)
+  2026-06-11  [concept] OAuth2 + OIDC flow
+      title: OAuth2 flow -> OAuth2 + OIDC flow
+```
+
+Edits re-embed the node for vector search, protect reserved operational state (locks, claims, coordination messages), and refuse to modify a node another agent has locked unless you pass `--force`. The per-type class can be overridden in config with `edit_policy: {document: additive}` if your team wants stricter history.
+
+## Profiles
+
+One machine, multiple sequestered graphs. Profiles map names to separate data directories so work and personal knowledge never mix — different DBs, different embeddings, different everything.
+
+```yaml
+# ~/.config/kindex/kin.yaml
+profiles:
+  work:
+    data_dir: ~/.kindex-work
+    roots: [~/Work]
+  personal:
+    data_dir: ~/.kindex
+    roots: [~/Code, ~/Personal]
+default_profile: personal
+```
+
+Resolution order (first match wins):
+
+1. `--profile <name>` flag
+2. `KIN_PROFILE` environment variable
+3. `profile:` key from the project's `.kin/config` chain
+4. Longest-prefix match of the current directory against profile `roots`
+5. `default_profile`
+6. Legacy single graph — no profiles configured means nothing changes
+
+```bash
+kin profile list                 # configured profiles + file-level stats
+kin profile which                # which profile this invocation resolves to
+# Two-step adoption: first register your existing graph as the default...
+kin profile create personal --data-dir ~/.kindex --roots ~/Code,~/Personal --default
+# ...then add the sequestered one
+kin profile create work --data-dir ~/.kindex-work --roots ~/Work
+kin status                       # shows: Profile: work (via roots)
+```
+
+Register the existing legacy graph (usually `~/.kindex`) as the default profile *before* creating others: once a default profile exists, sessions outside all roots route to it, and an unregistered legacy graph stops receiving cron maintenance (`kin profile create` warns when this would happen).
+
+**Stamp guard.** Each profile's database is stamped with its profile name on first open. Opening a stamped database under a different profile raises an error instead of silently mixing graphs — a wrong `--data-dir` can't cross-contaminate.
+
+**MCP note.** The MCP server binds its profile once at process start and keeps it for the process lifetime. To switch profiles for an agent, restart its MCP server (or run a second server with `KIN_PROFILE` set in its environment).
+
+`kin cron` runs one maintenance pass per profile and routes session ingestion by roots — sessions whose cwd falls under a profile's roots land in that profile's graph; the default profile takes the unmatched remainder. With no `default_profile`, a final legacy-remainder pass ingests the unmatched sessions into the legacy graph and keeps its maintenance (reminders, decay, dream) running. `kin cron --profile X` pins a single pass and keeps routing active — it only ingests the sessions X owns; a bare `--data-dir` with no resolved profile runs a legacy take-everything pass on exactly that directory. Routing also applies to `kin ingest sessions|codex-sessions`, the MCP `ingest` tool, and `kin watch`. An explicit `--data-dir` that overrides a profile's data_dir never stamps an unstamped database with the active profile.
+
+## Collab
+
+Multiple agents working the same graph can coordinate through conversations with members, read cursors, shared resources, advisory locks, and standing inject messages.
+
+```bash
+# Join a conversation as a member — members get unread tracking
+kin coord join payments-refactor
+
+# Attach a shared resource so members see who holds what
+kin coord attach payments-refactor invoice-schema
+
+# Advisory locks: signal "I'm working on this" — edits refuse foreign locks
+kin lock invoice-schema --ttl 60 --note "migrating columns"
+kin unlock invoice-schema
+
+# Targeted message — only alice sees it as unread-for-her
+kin coord post payments-refactor "schema branch is yours" --to alice@mbp
+
+# Standing inject message — pushed into members' context until cleared
+kin coord inject payments-refactor set "Don't touch the invoice schema until migration lands"
+kin coord inject payments-refactor clear
+```
+
+**Agent identity** resolves as `KIN_AGENT_ID` env > `agent_id` in config > `user@shorthost`. `kin whoami` shows both the user and the resolved agent id. Locks, claims, cursors, and message targeting all key off this identity.
+
+Members see their collabs in the session-start prime block:
+
+```
+### Active collabs
+- **payments-refactor** — 2 unread (focus: Extract billing service)
+  COLLAB MSG: Don't touch the invoice schema until migration lands (from alice@mbp)
+  Locked: invoice-schema (held by alice@mbp)
+  Check the collab: coord_read payments-refactor
+```
+
+New targeted/broadcast messages and standing injects also surface mid-session through the prompt hook (with a cooldown so they don't nag). Display is configurable:
+
+```yaml
+agent_id: jeremy-laptop        # optional; default user@shorthost
+collab:
+  enabled: true
+  display: full                # full | minimal (one line per collab) | quiet (no prime block)
+  prompt_cooldown_minutes: 10  # mid-session injection cooldown
+```
+
+Locks are advisory and expire — an expired lock never blocks anyone, and the cron pass sweeps stale locks, conversations, and task claims.
+
 ## .kin/ Directory & Inheritance
 
 Projects use `.kin/` directories that encode their communication style, engineering standards, and values. Teams inherit from orgs. Repos inherit from teams. The knowledge graph carries the voice forward.
@@ -287,11 +542,68 @@ audience: team
 domains: [payments, python]
 inherits:
   - ../platform/.kin/config
+work_policy:
+  require_active_tag: true
+  linear:
+    enabled: true        # opt-in; personal repos leave this false/absent
+    require_issue: true
+    team: ENG
+  git:
+    block_commit_without_tag: true
+    block_commit_without_linear: true
 ```
 
 The `.kin/` directory is the standard location for all kindex project artifacts:
 - `.kin/config` — project metadata (voice, domains, audience, inheritance)
 - `.kin/index.json` — graph snapshot for git tracking
+- `.kin/code-map.json` — repo-relative code map generated by `kin export code-map`
+- `.kin/.gitignore` — ignores local-only runtime state under `.kin/local`, `.kin/cache`, `.kin/tmp`, and `.kin/private`
+
+These files are meant to ship with the code. Do not ignore the whole `.kin/`
+directory in project `.gitignore`; ignore only local/private subdirectories.
+Kindex resolves project config from `--project-path`, then `KIN_PROJECT`, then
+the git worktree root, then the current directory. User config still lives in
+`~/.config/kindex/kin.yaml` and deep-merges below project config, so user
+preferences remain local while the repo's work contract travels with the repo.
+Generated `.kin/` snapshots use canonical, id-keyed ordering and omit volatile
+timestamps so repeated exports of unchanged source do not churn Git diffs.
+Concurrent branches merge them without manual conflicts via a structured merge
+driver that `kin index` registers automatically on first run (or `kin setup-merge`
+to (re)install it in a fresh clone). `.kin/index.json` is then unioned by node id
+(newer `updated_at` wins) and `.kin/code-map.json` by node/edge/layer — lossless
+across machines (regenerating from one machine's local DB would drop the other
+branch's nodes), with output byte-identical to a fresh `kin index`. `kin merge-kin`
+is the driver git invokes; repos without it registered fall back to git's default
+merge. Never hand-resolve a generated `.kin` snapshot.
+Tracked `.kin` artifacts must be self-contained and machine-portable: code-map
+paths are repo-relative POSIX paths, and task/report metadata must not point at
+`$HOME`, `/Users/...`, `/tmp/...`, or another developer-local filesystem
+location. If a scanner report is needed as evidence for future work, ship a
+repo-local subset or a durable shared artifact rather than a local pointer.
+
+`kin export code-map` is different from the normal graph export: it projects
+current code structure into a small dashboard- and agent-friendly graph of
+files, classes, functions, layers, and code dependencies. Use it when a tool
+needs the repo's code shape, not the full Kindex knowledge graph.
+
+| Export | Contains | Use case |
+| --- | --- | --- |
+| `kin export` | Audience-scoped Kindex nodes, edges, provenance, and graph metadata | Backup, exchange, or graph-level tooling |
+| `kin export code-map` | Current repo code structure, code dependencies, layers, and repo-relative file paths | Dashboards, code navigation, and agent tooling |
+
+For code-map output, `src/file.py` is portable; `/Users/alice/repo/src/file.py`
+and `C:\repo\src\file.py` are not.
+
+Code-map path requirements:
+- Output always uses repo-relative POSIX paths, even when the source machine is
+  Windows.
+- Absolute provenance is normalized only when it resolves inside the requested
+  repo root.
+- Outside-root, malformed, or unresolved paths are omitted with a safe warning
+  rather than leaked into the artifact.
+- Archived nodes are excluded by default because the tracked artifact describes
+  current code; API callers can opt into `include_archived=True` for historical
+  analysis.
 
 The payments service gets Acme's voice principles, the platform's engineering standards, AND its own domain context. Local values override ancestors. Lists merge with dedup. Parent directories auto-walk when no explicit `inherits` is set.
 
@@ -314,7 +626,7 @@ Retrieval pipeline:
       |                   full | abridged | summarized | executive | index
       |
   Embedding providers (configurable):
-      local (sentence-transformers) | openai | gemini
+      voyage-context-4 (contextual chunks) | openai | gemini | local
 
 LLM cache tiers (kin ask):
   Tier 1: codebook (stable node index)     <- cached @ 10% cost
@@ -327,12 +639,12 @@ Reminders:
   Channels:      system (macOS) | slack | email | claude (hook) | terminal
   Daemon:        launchd/cron adaptive interval -> check due -> notify -> auto-snooze
   Scheduling:    adaptive tiers (>7d=daily, >1d=hourly, >1h=10min, <1h=5min, none=disabled)
-  Actions:       shell commands run directly | complex tasks launch claude -p
+  Actions:       shell commands | claude -p | codex exec | opencode run
   Stop guard:    blocks session exit when actionable reminders pending
 
 Dream (kin dream):
   Modes:         lightweight (<5s) | full (non-LLM) | deep (claude -p clusters)
-  Triggers:      CLI | cron step 11 | Stop hook (detached, start_new_session=True)
+  Triggers:      CLI | cron step 11 | throttled Stop-time detach
   Dedup:         difflib.SequenceMatcher, 4-char title bucketing, 0.95 merge / 0.85 suggest
   Consolidation: suggestion auto-apply, domain edge strengthening, cluster summarisation
   Safety:        fcntl.flock exclusion, protected types skip, provenance tracking
@@ -356,13 +668,15 @@ Ingest repository structure with `kin ingest code --directory .`:
 - **Symbol nodes** (concept) — one per class/interface/type with method signatures
 - **Edges** — imports (`depends_on`), inheritance (`implements`), containment (`context_of`), call graph (`relates_to`)
 - **Three extraction tiers** — ctags (100+ languages), cscope (C/C++ cross-refs), tree-sitter (AST call graphs)
+- **Resilient fallback** — unsupported or untagged files still become module nodes; available tree-sitter parsers can still enrich those modules, with fallback provenance retained in metadata
 - **Incremental** — file hashing skips unchanged files on re-ingest
+- **Unity projects (opt-in)** — `--unity` (or `code_ingest: {unity: true}` in `.kin/config`) indexes serialized assets (`.unity`, `.prefab`, `.asset`, `.mat`, `.controller`, `.anim`), sniffs text-vs-binary serialization, and attaches each asset's `.meta` GUID so models can resolve GUID-based references; `code_ingest.include_extensions` maps further extensions (e.g. `.shader: Unity Shader`)
 
 Code structure lives in the same graph as your decisions, watches, and constraints. Search finds both what calls a function and what broke last time someone changed it.
 
 **Operational**: constraint (invariants), directive (soft rules), checkpoint (pre-flight), watch (attention flags)
 
-## CLI Reference (49 commands)
+## CLI Reference (70+ commands)
 
 ### Core
 | Command | Description |
@@ -379,6 +693,8 @@ Code structure lives in the same graph as your decisions, watches, and constrain
 |---------|-------------|
 | `kin learn` | Extract knowledge from sessions and inbox |
 | `kin link <a> <b>` | Create weighted edge between nodes |
+| `kin edit <id>` | Policy-aware in-place edit (--title, --content, --append, --add-tags, --expires) |
+| `kin supersede <id> <text>` | Replace a node with a new one, preserving history (--reason) |
 | `kin alias <id> [add\|remove\|list]` | Manage AKA/synonyms for a node |
 | `kin register <id> <path>` | Associate a file path with a node |
 | `kin orphans` | Nodes with no connections |
@@ -395,7 +711,17 @@ Code structure lives in the same graph as your decisions, watches, and constrain
 | `kin graph [mode]` | Dashboard: stats, centrality, communities, bridges, trailheads |
 | `kin suggest` | Bridge opportunity suggestions (--accept, --reject) |
 | `kin skills [person]` | Skill profile and expertise for a person |
-| `kin embed` | Index all nodes for vector similarity search |
+| `kin embed` | Index nodes for vector similarity search |
+| `kin embed plan/enqueue/reindex/drain/status` | Scoped embedding maintenance for full or gradual reindexing |
+
+`embedding.provider: voyage` uses `voyage-context-4` by default. When the
+configured model supports contextual chunk embeddings, Kindex stores stable
+overlapping chunk vectors and aggregates chunk hits back to the parent node. Use
+`kin embed plan --stale --kin ./path/.kin` to estimate a targeted update,
+`kin embed enqueue --stale --tags mea` to trickle selected work through cron, or
+`kin embed reindex --target ./repo --limit 100` for a bounded foreground pass.
+Unsupported providers/models keep the single-vector strategy unless they later
+gain explicit contextual support.
 
 ### Operational
 | Command | Description |
@@ -404,8 +730,17 @@ Code structure lives in the same graph as your decisions, watches, and constrain
 | `kin set-audience <id> <scope>` | Set privacy scope (private/team/org/public) |
 | `kin set-state <id> <key> <value>` | Set mutable state on directives/watches |
 | `kin export` | Audience-aware graph export with PII stripping |
+| `kin export code-map` | Repo-relative code map for dashboards, code navigation, and agent tooling |
 | `kin import <file>` | Import nodes/edges from JSON/JSONL (--mode merge/replace) |
 | `kin sync-links` | Update node content with connection references |
+
+### Collab & Multi-Agent
+| Command | Description |
+|---------|-------------|
+| `kin coord [action]` | Agent coordination: start, post, read, list, end, join, attach, inject |
+| `kin lock <id>` | Acquire an advisory lock on a node (--ttl, --note, --force) |
+| `kin unlock <id>` | Release an advisory lock (--force for foreign locks) |
+| `kin profile [action]` | Named graph profiles: list, which, create |
 
 ### Ingestion & External Sources
 | Command | Description |
@@ -416,21 +751,36 @@ Code structure lives in the same graph as your decisions, watches, and constrain
 | `kin watch` | Watch for new sessions and ingest them (--interval) |
 | `kin analytics` | Archive session analytics and activity heatmap |
 | `kin index` | Write .kin/index.json for git tracking |
+| `kin merge-kin` | Git merge driver: structured union merge of `.kin` artifacts (invoked by git) |
 
 ### Infrastructure
 | Command | Description |
 |---------|-------------|
 | `kin init` | Initialize data directory |
 | `kin config [show\|get\|set]` | View or edit configuration |
+| `kin agent-config [show\|set]` | View or tune per-client/per-instance agent behavior overrides |
+| `kin policy [show\|check]` | Show or enforce project work policy from `.kin/config` |
+| `kin setup-merge` | Register the `.kin` structured merge driver in the current git repo |
 | `kin setup-hooks` | Install lifecycle hooks into Claude Code |
+| `kin setup-codex-hooks` | Install prompt-time attention hook into Codex |
 | `kin setup-codex-mcp` | Install kindex MCP server into Codex |
-| `kin setup-cron` | Install periodic maintenance (launchd/crontab) |
+| `kin setup-gemini-mcp` | Install kindex MCP server into Gemini CLI |
+| `kin setup-antigravity-mcp` | Install kindex MCP server into Google Antigravity |
+| `kin setup-antigravity-hooks` | Install lifecycle hooks into Google Antigravity |
+| `kin setup-opencode-mcp` | Install kindex MCP server into OpenCode |
+| `kin setup-cursor-mcp` | Install kindex MCP server into Cursor |
+| `kin setup-cron` | Install periodic maintenance + dedicated reminder-check job (launchd/crontab) |
 | `kin setup-claude-md` | Output/install recommended CLAUDE.md kindex directives |
-| `kin setup-agents-md` | Output/install recommended AGENTS.md kindex directives |
+| `kin setup-agents-md` | Output/install recommended AGENTS.md kindex directives (Codex, OpenCode) |
+| `kin setup-gemini-md` | Output/install recommended GEMINI.md kindex directives |
+| `kin setup-antigravity-md` | Output/install Antigravity/GEMINI.md kindex directives |
+| `kin setup-cursor-rules` | Output/install recommended Cursor rule (.mdc) for kindex |
 | `kin stop-guard` | Stop hook guard for actionable reminders |
 | `kin doctor` | Health check with graph enforcement (--fix) |
 | `kin migrate` | Import markdown topics into SQLite |
 | `kin budget` | LLM spend tracking |
+| `kin attention` | Toggle/check/estimate conversation-attention reminder injection |
+| `kin attention-hook` | Advisory attention hook for prompt/tool events |
 | `kin whoami` | Show current user identity |
 | `kin changelog` | What changed (--since, --days, --actor) |
 | `kin log` | Recent activity log |
@@ -445,31 +795,81 @@ Config is layered like git — global defaults, then global config, then local c
 | Layer | Path | Purpose |
 |-------|------|---------|
 | Global | `~/.config/kindex/kin.yaml` | User-wide defaults |
-| Local | `.kin/config` or `kin.yaml` in cwd | Project-specific overrides |
+| Local | `.kin/config` or `kin.yaml` at project root | Project-specific overrides shipped with code |
 
-Use `kin config set --global llm.enabled true` for global settings, or `kin config set llm.model claude-sonnet-4-6` for project-local.
+Use `kin config set --global llm.enabled true` for global settings, or `kin config set llm.model claude-sonnet-4-6` for project-local. Use `--project-path /path/to/repo` or `KIN_PROJECT=/path/to/repo` when running from outside the repo.
+
+Agent-facing behavior can be tuned at three levels:
+
+```bash
+# Global/project default for every client
+kin config set attention.tick_interval 3
+
+# Client default, e.g. every Claude session
+kin agent-config set attention.tick_interval 2 --client claude
+
+# One instance/conversation
+kin agent-config set hooks.prime_tokens 1200 --client claude --scope instance --instance session-a
+```
+
+`agent-config` writes only approved behavior keys such as `attention.*`,
+`sim.*`, `collab.prompt_cooldown_minutes`, and `hooks.prime_tokens`; it cannot
+change storage paths or arbitrary config. Agents should propose these changes
+through their normal tool/command permission flow. Antigravity hooks force a user
+permission prompt before `kin config set` or `kin agent-config set` runs.
+
+```yaml
+agents:
+  clients:
+    claude:
+      attention:
+        tick_interval: 2
+        display: quiet
+  instances:
+    claude:session-a:
+      client: claude
+      attention:
+        tick_interval: 1
+      hooks:
+        prime_tokens: 1200
+```
 
 ```yaml
 data_dir: ~/.kindex
 
 llm:
   enabled: false
+  provider: anthropic             # anthropic or openai
   model: claude-haiku-4-5-20251001
-  api_key_env: ANTHROPIC_API_KEY
+  api_key_env: ANTHROPIC_API_KEY   # comma-separated fallback allowed
   cache_control: true              # Prompt caching (90% savings on repeated prefixes)
   codebook_min_weight: 0.5         # Min node weight for codebook inclusion
   tier2_max_tokens: 4000           # Token budget for query-relevant context
 
 embedding:
-  provider: local                  # local, openai, or gemini
-  # model: ""                      # empty = provider default
-  # api_key_env: ""                # empty = provider default (OPENAI_API_KEY / GEMINI_API_KEY)
-  # dimensions: 0                  # 0 = provider default (384 / 1536 / 3072)
+  provider: voyage                 # voyage, openai, gemini, or local
+  # model: ""                      # empty = provider default (voyage-context-4 for Voyage)
+  # api_key_env: ""                # empty = provider default (VOYAGE_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)
+  # dimensions: 0                  # 0 = provider default (1024 / 1536 / 3072 / 384)
+  # strategy: ""                   # empty/auto; contextual only when the model supports it
+  # chunk_chars: 6000              # stable local chunks for contextual embedding models
+  # chunk_overlap_chars: 600
+  # max_group_chunks: 20
+  # reindex_max_jobs: 200          # cron drain cap for queued embedding work
+  # reindex_max_queue: 100000
 
 budget:
   daily: 0.50
   weekly: 2.00
   monthly: 5.00
+
+attention:
+  enabled: false                  # default; runtime override with `kin attention on/off`
+  tick_interval: 3                # run every N prompt-check ticks
+  max_candidates: 6               # deterministic prefilter size before LLM judge
+  max_check_cost: 0.01            # estimated per-check cap
+  max_conversation_cost: 0.25     # best-effort cap when the client provides a stable session id
+  cooldown_seconds: 1800          # suppress repeat injections
 
 project_dirs:
   - ~/Code
@@ -489,6 +889,9 @@ reminders:
   snooze_duration: 900           # 15 min default snooze
   auto_snooze_timeout: 300       # auto-snooze after 5 min inaction
   idle_suppress_after: 600       # suppress if idle > 10 min
+  stop_guard_enabled: false      # opt-in; blocking Stop hooks are noisy in Claude
+  dream_on_stop_enabled: true    # launch throttled detached dream from Claude Stop hook
+  dream_min_interval: 3600       # seconds between scheduled/hook dream starts
   channels:
     slack:
       enabled: false
@@ -499,11 +902,13 @@ reminders:
       to_addr: ""
 ```
 
+Use `kin attention estimate --messages 1000` to estimate cost over a fixed prompt window. Conversation accounting is retained when a client provides a stable session id. Hook-driven attention does not fall back to cwd as a fake conversation id, because that would cross-pollute two chats open in the same repo.
+
 ## Development
 
 ```bash
 make dev          # install with dev + LLM dependencies
-make test         # run 980 tests
+make test         # run 1502 tests
 make check        # lint + test combined
 make clean        # remove build artifacts
 ```

@@ -1,0 +1,1849 @@
+{
+  "version": "1.0.0",
+  "project": {
+    "name": "kindex",
+    "description": "Code map exported from Kindex for kindex.",
+    "languages": [
+      "Python",
+      "Shell"
+    ],
+    "frameworks": [],
+    "analyzedAt": "2026-07-15T21:36:11-05:00",
+    "gitCommitHash": "0469bce33119f2aef516de371d1ac8bf36e3aa4d"
+  },
+  "nodes": [
+    {
+      "id": "code-mod-kindex-0fae9ff61910",
+      "type": "file",
+      "name": "scripts/sync-version.sh",
+      "filePath": "scripts/sync-version.sh",
+      "summary": "Language: Shell | Path: scripts/sync-version.sh | ~54 lines",
+      "tags": [
+        "code",
+        "shell"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Shell",
+        "kindexType": "artifact",
+        "toolTier": "A"
+      }
+    },
+    {
+      "id": "code-mod-kindex-c4522229e518",
+      "type": "file",
+      "name": "src/kindex/__init__.py",
+      "filePath": "src/kindex/__init__.py",
+      "summary": "Language: Python | Path: src/kindex/__init__.py | ~3 lines",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1fd61a2a944a",
+      "type": "file",
+      "name": "src/kindex/actions.py",
+      "filePath": "src/kindex/actions.py",
+      "summary": "Language: Python | Path: src/kindex/actions.py | ~320 lines ## Functions - execute_action( store: Store, reminder: dict, config: Config, *, timeout: int = 300, manual: bool = False, ) -> dict",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 12,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-aa2ebf2ad1ea",
+      "type": "class",
+      "name": "Adapter",
+      "filePath": "src/kindex/adapters/base.py",
+      "summary": "class Adapter(Protocol) (src/kindex/adapters/base.py:92) ## Methods - ingest( self, store: Store, *, limit: int = 50, since: str | None = None, verbose: bool = False, **kwargs: Any, ) -> IngestResult",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 2,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-7ccf79c98767",
+      "type": "file",
+      "name": "src/kindex/adapters/base.py",
+      "filePath": "src/kindex/adapters/base.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/base.py | ~126 lines ## Classes - Adapter(Protocol)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 4,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-c36798e40719",
+      "type": "file",
+      "name": "src/kindex/adapters/code.py",
+      "filePath": "src/kindex/adapters/code.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/code.py | ~1619 lines ## Classes - CodeAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 36,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-78b780114b82",
+      "type": "class",
+      "name": "CodexSessionsAdapter",
+      "filePath": "src/kindex/adapters/codex_sessions.py",
+      "summary": "class CodexSessionsAdapter (src/kindex/adapters/codex_sessions.py:8) ## Methods - ingest(self, store, *, limit=50, since=None, verbose=False, **kwargs)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 2,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-b4872208bf57",
+      "type": "file",
+      "name": "src/kindex/adapters/codex_sessions.py",
+      "filePath": "src/kindex/adapters/codex_sessions.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/codex_sessions.py | ~32 lines ## Classes - CodexSessionsAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-fd3863146db0",
+      "type": "file",
+      "name": "src/kindex/adapters/git_hooks.py",
+      "filePath": "src/kindex/adapters/git_hooks.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/git_hooks.py | ~237 lines ## Classes - CommitsAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 5,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-2ecdcb3c4276",
+      "type": "file",
+      "name": "src/kindex/adapters/github.py",
+      "filePath": "src/kindex/adapters/github.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/github.py | ~266 lines ## Classes - GitHubAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 6,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-4af5ee17841c",
+      "type": "file",
+      "name": "src/kindex/adapters/linear.py",
+      "filePath": "src/kindex/adapters/linear.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/linear.py | ~145 lines ## Classes - LinearAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 4,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1a589d0d4ff2",
+      "type": "file",
+      "name": "src/kindex/adapters/pipeline.py",
+      "filePath": "src/kindex/adapters/pipeline.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/pipeline.py | ~116 lines ## Classes - IngestConfig",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 3,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1008402a94e8",
+      "type": "file",
+      "name": "src/kindex/adapters/registry.py",
+      "filePath": "src/kindex/adapters/registry.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/registry.py | ~149 lines ## Functions - available() -> dict[str,Adapter]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 6,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-b404f7bbed67",
+      "type": "class",
+      "name": "UnderstandAnythingAdapter",
+      "filePath": "src/kindex/adapters/understand_anything.py",
+      "summary": "class UnderstandAnythingAdapter (src/kindex/adapters/understand_anything.py:14) ## Methods - ingest( self, store: \"Store\", *, limit: int = 10000, since: str | None = None, verbose: bool = False, **kwargs: Any, ) -> IngestResult",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 2,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-bffe64dbd53e",
+      "type": "file",
+      "name": "src/kindex/adapters/understand_anything.py",
+      "filePath": "src/kindex/adapters/understand_anything.py",
+      "summary": "Language: Python | Path: src/kindex/adapters/understand_anything.py | ~49 lines ## Classes - UnderstandAnythingAdapter",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-0c0f8066c77b",
+      "type": "file",
+      "name": "src/kindex/agent_adapters.py",
+      "filePath": "src/kindex/agent_adapters.py",
+      "summary": "Language: Python | Path: src/kindex/agent_adapters.py | ~263 lines ## Functions - adapter_scoped_out(tags: Any, adapter: str | None) -> bool",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 12,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-5998a0a5ca33",
+      "type": "file",
+      "name": "src/kindex/agent_settings.py",
+      "filePath": "src/kindex/agent_settings.py",
+      "summary": "Language: Python | Path: src/kindex/agent_settings.py | ~251 lines ## Functions - agent_config_write_key( *, scope: str, client: str, instance_key: str, setting_key: str, ) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 12,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-7e3e66278abe",
+      "type": "file",
+      "name": "src/kindex/archive.py",
+      "filePath": "src/kindex/archive.py",
+      "summary": "Language: Python | Path: src/kindex/archive.py | ~358 lines ## Functions - archive_cycle( config: \"Config\", store: \"Store\", verbose: bool = False, ) -> int",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 11,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-1ca6d2b3a552",
+      "type": "class",
+      "name": "AttentionInjection",
+      "filePath": "src/kindex/attention.py",
+      "summary": "class AttentionInjection (src/kindex/attention.py:62)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-49ac56615e1e",
+      "type": "class",
+      "name": "AttentionCandidate",
+      "filePath": "src/kindex/attention.py",
+      "summary": "class AttentionCandidate (src/kindex/attention.py:51)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-086378eea6e0",
+      "type": "file",
+      "name": "src/kindex/attention.py",
+      "filePath": "src/kindex/attention.py",
+      "summary": "Language: Python | Path: src/kindex/attention.py | ~1501 lines ## Classes - AttentionCandidate",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 54,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-858b7166f927",
+      "type": "file",
+      "name": "src/kindex/budget.py",
+      "filePath": "src/kindex/budget.py",
+      "summary": "Language: Python | Path: src/kindex/budget.py | ~166 lines ## Classes - BudgetLedger",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 4,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-66df7720eed6",
+      "type": "file",
+      "name": "src/kindex/cli.py",
+      "filePath": "src/kindex/cli.py",
+      "summary": "Language: Python | Path: src/kindex/cli.py | ~6592 lines ## Functions - build_parser() -> argparse.ArgumentParser",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 105,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-e381cc44d87c",
+      "type": "file",
+      "name": "src/kindex/code_map.py",
+      "filePath": "src/kindex/code_map.py",
+      "summary": "Language: Python | Path: src/kindex/code_map.py | ~548 lines ## Functions - export_understand_anything( store: \"Store\", *, directory: str | Path | None = None, project_name: str | None = None, limit: int = 10000, include_archived: bool = False, ) -> dict[str,Any]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 28,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-05a1fbf0db2e",
+      "type": "class",
+      "name": "AgentsConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class AgentsConfig(BaseModel) (src/kindex/config.py:55)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-0850aa56538b",
+      "type": "class",
+      "name": "ProfileEntry",
+      "filePath": "src/kindex/config.py",
+      "summary": "class ProfileEntry(BaseModel) (src/kindex/config.py:28)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-08e1ea9d3cda",
+      "type": "class",
+      "name": "ReminderConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class ReminderConfig(BaseModel) (src/kindex/config.py:293)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-15261553fafb",
+      "type": "class",
+      "name": "SimConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class SimConfig(BaseModel) (src/kindex/config.py:168)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-200aad86be36",
+      "type": "class",
+      "name": "AttentionConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class AttentionConfig(BaseModel) (src/kindex/config.py:95)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-279e1c45cb06",
+      "type": "class",
+      "name": "AgentInstanceConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class AgentInstanceConfig(AgentOverrideConfig) (src/kindex/config.py:50)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-352d8c9bbdba",
+      "type": "class",
+      "name": "CollabConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class CollabConfig(BaseModel) (src/kindex/config.py:35)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-36fe0270bb97",
+      "type": "class",
+      "name": "ScheduleTier",
+      "filePath": "src/kindex/config.py",
+      "summary": "class ScheduleTier(BaseModel) (src/kindex/config.py:280)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-415d46d7c508",
+      "type": "class",
+      "name": "RankingConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class RankingConfig(BaseModel) (src/kindex/config.py:210) ## Methods - ensemble_weights(self) -> dict[str,float]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-552c22e16187",
+      "type": "class",
+      "name": "WorkPolicyConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class WorkPolicyConfig(BaseModel) (src/kindex/config.py:336)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-58d630bc994a",
+      "type": "class",
+      "name": "ClaudeChannelConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class ClaudeChannelConfig(BaseModel) (src/kindex/config.py:259)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-608ef82e510c",
+      "type": "class",
+      "name": "Config",
+      "filePath": "src/kindex/config.py",
+      "summary": "class Config(BaseModel) (src/kindex/config.py:355) ## Methods - antigravity_cli_path(self) -> Path",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 16,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-62490d9465aa",
+      "type": "class",
+      "name": "TelegramChannelConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class TelegramChannelConfig(BaseModel) (src/kindex/config.py:265)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-74266f41225f",
+      "type": "class",
+      "name": "SystemChannelConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class SystemChannelConfig(BaseModel) (src/kindex/config.py:239)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-7e4d614285e9",
+      "type": "class",
+      "name": "SlackChannelConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class SlackChannelConfig(BaseModel) (src/kindex/config.py:244)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-89cc5b13c9e0",
+      "type": "class",
+      "name": "EmailChannelConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class EmailChannelConfig(BaseModel) (src/kindex/config.py:249)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-979d447616b7",
+      "type": "class",
+      "name": "AgentOverrideConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class AgentOverrideConfig(BaseModel) (src/kindex/config.py:42)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-a8ad139fc733",
+      "type": "class",
+      "name": "LinearPolicyConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class LinearPolicyConfig(BaseModel) (src/kindex/config.py:323)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-b42e459fa446",
+      "type": "class",
+      "name": "DefaultsConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class DefaultsConfig(BaseModel) (src/kindex/config.py:233)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-b90676bdf42f",
+      "type": "class",
+      "name": "EmbeddingConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class EmbeddingConfig(BaseModel) (src/kindex/config.py:65)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-c30edae67b27",
+      "type": "class",
+      "name": "CodeIngestConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class CodeIngestConfig(BaseModel) (src/kindex/config.py:342)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-c644dbd33873",
+      "type": "class",
+      "name": "GitPolicyConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class GitPolicyConfig(BaseModel) (src/kindex/config.py:329)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-fe4d5554b184",
+      "type": "class",
+      "name": "ChannelsConfig",
+      "filePath": "src/kindex/config.py",
+      "summary": "class ChannelsConfig(BaseModel) (src/kindex/config.py:272)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-6a3142a46050",
+      "type": "file",
+      "name": "src/kindex/config.py",
+      "filePath": "src/kindex/config.py",
+      "summary": "Language: Python | Path: src/kindex/config.py | ~823 lines ## Classes - AgentInstanceConfig(AgentOverrideConfig)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 41,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-b1b2fdefbdd0",
+      "type": "file",
+      "name": "src/kindex/coordination.py",
+      "filePath": "src/kindex/coordination.py",
+      "summary": "Language: Python | Path: src/kindex/coordination.py | ~542 lines ## Functions - active_collabs_for_agent(store: Store, agent: str) -> list[dict]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 23,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1668da8a23a5",
+      "type": "file",
+      "name": "src/kindex/daemon.py",
+      "filePath": "src/kindex/daemon.py",
+      "summary": "Language: Python | Path: src/kindex/daemon.py | ~849 lines ## Functions - cron_run(config: \"Config\", store: \"Store\", verbose: bool = False) -> dict",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 14,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-5aa57e096c49",
+      "type": "file",
+      "name": "src/kindex/dream.py",
+      "filePath": "src/kindex/dream.py",
+      "summary": "Language: Python | Path: src/kindex/dream.py | ~552 lines ## Functions - auto_apply_suggestions(store: Store) -> int",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 19,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-26bb9b6e1fcb",
+      "type": "file",
+      "name": "src/kindex/graph.py",
+      "filePath": "src/kindex/graph.py",
+      "summary": "Language: Python | Path: src/kindex/graph.py | ~443 lines ## Classes - GraphStats",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 18,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-bd222a4e378f",
+      "type": "file",
+      "name": "src/kindex/hooks.py",
+      "filePath": "src/kindex/hooks.py",
+      "summary": "Language: Python | Path: src/kindex/hooks.py | ~595 lines ## Functions - capture_session_end( store: Store, config: Config, ledger: BudgetLedger, session_text: str | None = None, ) -> int",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 4,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1cc1824729d5",
+      "type": "file",
+      "name": "src/kindex/ingest.py",
+      "filePath": "src/kindex/ingest.py",
+      "summary": "Language: Python | Path: src/kindex/ingest.py | ~1120 lines ## Functions - detect_expertise(store: \"Store\", person_node_id: str) -> dict[str,int]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 27,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-13363db31233",
+      "type": "file",
+      "name": "src/kindex/kin_merge.py",
+      "filePath": "src/kindex/kin_merge.py",
+      "summary": "Language: Python | Path: src/kindex/kin_merge.py | ~237 lines ## Functions - dumps_code_map(obj: dict) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 9,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-d54d2e7410ef",
+      "type": "file",
+      "name": "src/kindex/llm.py",
+      "filePath": "src/kindex/llm.py",
+      "summary": "Language: Python | Path: src/kindex/llm.py | ~337 lines ## Functions - calculate_cost(model: str, usage) -> dict",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 14,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-eb0caa51072f",
+      "type": "file",
+      "name": "src/kindex/locks.py",
+      "filePath": "src/kindex/locks.py",
+      "summary": "Language: Python | Path: src/kindex/locks.py | ~118 lines ## Functions - cleanup_expired_locks(store: Store) -> int",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 5,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-f9986c492ab2",
+      "type": "file",
+      "name": "src/kindex/mcp_server.py",
+      "filePath": "src/kindex/mcp_server.py",
+      "summary": "Language: Python | Path: src/kindex/mcp_server.py | ~2151 lines ## Functions - add( text: str, node_type: str = \"concept\", tags: str = \"\", domains: str = \"\", audience: str = \"private\", ) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 69,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-539e76b9be1f",
+      "type": "class",
+      "name": "Edge",
+      "filePath": "src/kindex/models.py",
+      "summary": "class Edge(BaseModel) (src/kindex/models.py:11)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-92df373f87c7",
+      "type": "file",
+      "name": "src/kindex/notify.py",
+      "filePath": "src/kindex/notify.py",
+      "summary": "Language: Python | Path: src/kindex/notify.py | ~393 lines ## Classes - ClaudeChannel",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 14,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-9d295ea2d8a3",
+      "type": "class",
+      "name": "ReinforceOutcome",
+      "filePath": "src/kindex/reinforce.py",
+      "summary": "class ReinforceOutcome (src/kindex/reinforce.py:204)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-4d774506f9e3",
+      "type": "file",
+      "name": "src/kindex/reinforce.py",
+      "filePath": "src/kindex/reinforce.py",
+      "summary": "Language: Python | Path: src/kindex/reinforce.py | ~465 lines ## Classes - ReinforceOutcome",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 17,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-1b467bb9761a",
+      "type": "file",
+      "name": "src/kindex/reminders.py",
+      "filePath": "src/kindex/reminders.py",
+      "summary": "Language: Python | Path: src/kindex/reminders.py | ~820 lines ## Functions - advance_recurring(store: Store, reminder_id: str) -> str|None",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 26,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-d68e56207179",
+      "type": "file",
+      "name": "src/kindex/retrieve.py",
+      "filePath": "src/kindex/retrieve.py",
+      "summary": "Language: Python | Path: src/kindex/retrieve.py | ~871 lines ## Functions - auto_select_tier(available_tokens: int | None = None) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 28,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-70d2128d6f82",
+      "type": "file",
+      "name": "src/kindex/routing.py",
+      "filePath": "src/kindex/routing.py",
+      "summary": "Language: Python | Path: src/kindex/routing.py | ~210 lines ## Functions - cwd_profile_owner(cwd: str, profiles: dict) -> str|None",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 9,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-21dd45af3575",
+      "type": "file",
+      "name": "src/kindex/scheduling.py",
+      "filePath": "src/kindex/scheduling.py",
+      "summary": "Language: Python | Path: src/kindex/scheduling.py | ~162 lines ## Functions - apply_schedule(interval: int, config: \"Config\") -> dict",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 7,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-c8ebc72bbedb",
+      "type": "file",
+      "name": "src/kindex/schema.py",
+      "filePath": "src/kindex/schema.py",
+      "summary": "Language: Python | Path: src/kindex/schema.py | ~67 lines ## Functions - edit_class_for(node_type: str, overrides: dict[str, str] | None = None) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-ce3301c705b3",
+      "type": "file",
+      "name": "src/kindex/scoping.py",
+      "filePath": "src/kindex/scoping.py",
+      "summary": "Language: Python | Path: src/kindex/scoping.py | ~77 lines ## Functions - extra_conversation_id(extra: dict[str, Any] | None) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 4,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-c77f7cec7d57",
+      "type": "file",
+      "name": "src/kindex/sessions.py",
+      "filePath": "src/kindex/sessions.py",
+      "summary": "Language: Python | Path: src/kindex/sessions.py | ~289 lines ## Functions - add_segment( store: Store, name: str, *, new_focus: str, summary: str = \"\", decisions: list[str] | None = None, ) -> None",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 12,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-62731532a556",
+      "type": "file",
+      "name": "src/kindex/setup.py",
+      "filePath": "src/kindex/setup.py",
+      "summary": "Language: Python | Path: src/kindex/setup.py | ~1219 lines ## Functions - git_repo_root(start: \"str | Path | None\" = None) -> \"Path | None\"",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 38,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-2fcd370316b8",
+      "type": "file",
+      "name": "src/kindex/sim.py",
+      "filePath": "src/kindex/sim.py",
+      "summary": "Language: Python | Path: src/kindex/sim.py | ~595 lines ## Functions - build_sim_grounding(store: \"Store\", window: str, config: Config) -> str",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 24,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-sym-kindex-95b8acd87972",
+      "type": "class",
+      "name": "Store",
+      "filePath": "src/kindex/store.py",
+      "summary": "class Store (src/kindex/store.py:123) ## Methods - active_checkpoints(self, trigger: str | None = None) -> list[dict]",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 56,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-9f9f9fbe1087",
+      "type": "class",
+      "name": "EditPolicyError",
+      "filePath": "src/kindex/store.py",
+      "summary": "class EditPolicyError(ValueError) (src/kindex/store.py:38)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-b166b6681594",
+      "type": "class",
+      "name": "LockHeldError",
+      "filePath": "src/kindex/store.py",
+      "summary": "class LockHeldError(RuntimeError) (src/kindex/store.py:42)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-sym-kindex-b724908147cc",
+      "type": "class",
+      "name": "ProfileMismatchError",
+      "filePath": "src/kindex/store.py",
+      "summary": "class ProfileMismatchError(RuntimeError) (src/kindex/store.py:46)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 1,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "concept",
+        "toolTier": ""
+      }
+    },
+    {
+      "id": "code-mod-kindex-46a31493a160",
+      "type": "file",
+      "name": "src/kindex/store.py",
+      "filePath": "src/kindex/store.py",
+      "summary": "Language: Python | Path: src/kindex/store.py | ~1915 lines ## Classes - EditPolicyError(ValueError)",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 12,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-702e4442e57e",
+      "type": "file",
+      "name": "src/kindex/tasks.py",
+      "filePath": "src/kindex/tasks.py",
+      "summary": "Language: Python | Path: src/kindex/tasks.py | ~463 lines ## Functions - cancel_task(store: Store, task_id: str) -> dict|None",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 18,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    },
+    {
+      "id": "code-mod-kindex-6a374a6f7fce",
+      "type": "file",
+      "name": "src/kindex/vectors.py",
+      "filePath": "src/kindex/vectors.py",
+      "summary": "Language: Python | Path: src/kindex/vectors.py | ~1018 lines ## Functions - contextual_embeddings_supported(config: Config | None) -> bool",
+      "tags": [
+        "code",
+        "python"
+      ],
+      "complexity": 44,
+      "languageNotes": {
+        "language": "Python",
+        "kindexType": "artifact",
+        "toolTier": "C"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "code-mod-kindex-086378eea6e0",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-0c0f8066c77b",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-1668da8a23a5",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.2806
+    },
+    {
+      "source": "code-mod-kindex-1b467bb9761a",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-1cc1824729d5",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-21dd45af3575",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-66df7720eed6",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-70d2128d6f82",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-92df373f87c7",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-b1b2fdefbdd0",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-c36798e40719",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-c77f7cec7d57",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-d68e56207179",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-mod-kindex-e381cc44d87c",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "depends_on",
+      "direction": "outbound",
+      "weight": 0.5
+    },
+    {
+      "source": "code-sym-kindex-05a1fbf0db2e",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-0850aa56538b",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-08e1ea9d3cda",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-15261553fafb",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-1ca6d2b3a552",
+      "target": "code-mod-kindex-086378eea6e0",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-200aad86be36",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-279e1c45cb06",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-352d8c9bbdba",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-36fe0270bb97",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-415d46d7c508",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-49ac56615e1e",
+      "target": "code-mod-kindex-086378eea6e0",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-552c22e16187",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-58d630bc994a",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-608ef82e510c",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-62490d9465aa",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-74266f41225f",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-78b780114b82",
+      "target": "code-mod-kindex-b4872208bf57",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.2222
+    },
+    {
+      "source": "code-sym-kindex-7e4d614285e9",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-89cc5b13c9e0",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-95b8acd87972",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-979d447616b7",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-9d295ea2d8a3",
+      "target": "code-mod-kindex-4d774506f9e3",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.3367
+    },
+    {
+      "source": "code-sym-kindex-9f9f9fbe1087",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-a8ad139fc733",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-aa2ebf2ad1ea",
+      "target": "code-mod-kindex-7ccf79c98767",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-b166b6681594",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-b404f7bbed67",
+      "target": "code-mod-kindex-bffe64dbd53e",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.2222
+    },
+    {
+      "source": "code-sym-kindex-b42e459fa446",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-b724908147cc",
+      "target": "code-mod-kindex-46a31493a160",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.5345
+    },
+    {
+      "source": "code-sym-kindex-b90676bdf42f",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-c30edae67b27",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-c644dbd33873",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    },
+    {
+      "source": "code-sym-kindex-fe4d5554b184",
+      "target": "code-mod-kindex-6a3142a46050",
+      "type": "contains",
+      "direction": "outbound",
+      "weight": 0.6
+    }
+  ],
+  "layers": [
+    {
+      "id": "core",
+      "name": "Core",
+      "description": "Kindex-inferred core layer.",
+      "nodeIds": [
+        "code-mod-kindex-086378eea6e0",
+        "code-mod-kindex-0c0f8066c77b",
+        "code-mod-kindex-0fae9ff61910",
+        "code-mod-kindex-1008402a94e8",
+        "code-mod-kindex-13363db31233",
+        "code-mod-kindex-1668da8a23a5",
+        "code-mod-kindex-1a589d0d4ff2",
+        "code-mod-kindex-1b467bb9761a",
+        "code-mod-kindex-1cc1824729d5",
+        "code-mod-kindex-1fd61a2a944a",
+        "code-mod-kindex-21dd45af3575",
+        "code-mod-kindex-26bb9b6e1fcb",
+        "code-mod-kindex-2ecdcb3c4276",
+        "code-mod-kindex-2fcd370316b8",
+        "code-mod-kindex-4af5ee17841c",
+        "code-mod-kindex-4d774506f9e3",
+        "code-mod-kindex-5998a0a5ca33",
+        "code-mod-kindex-5aa57e096c49",
+        "code-mod-kindex-62731532a556",
+        "code-mod-kindex-66df7720eed6",
+        "code-mod-kindex-6a3142a46050",
+        "code-mod-kindex-6a374a6f7fce",
+        "code-mod-kindex-702e4442e57e",
+        "code-mod-kindex-70d2128d6f82",
+        "code-mod-kindex-7ccf79c98767",
+        "code-mod-kindex-7e3e66278abe",
+        "code-mod-kindex-858b7166f927",
+        "code-mod-kindex-92df373f87c7",
+        "code-mod-kindex-b1b2fdefbdd0",
+        "code-mod-kindex-b4872208bf57",
+        "code-mod-kindex-bd222a4e378f",
+        "code-mod-kindex-bffe64dbd53e",
+        "code-mod-kindex-c36798e40719",
+        "code-mod-kindex-c4522229e518",
+        "code-mod-kindex-c77f7cec7d57",
+        "code-mod-kindex-ce3301c705b3",
+        "code-mod-kindex-d54d2e7410ef",
+        "code-mod-kindex-d68e56207179",
+        "code-mod-kindex-e381cc44d87c",
+        "code-mod-kindex-eb0caa51072f",
+        "code-mod-kindex-f9986c492ab2",
+        "code-mod-kindex-fd3863146db0"
+      ]
+    },
+    {
+      "id": "data",
+      "name": "Data",
+      "description": "Kindex-inferred data layer.",
+      "nodeIds": [
+        "code-mod-kindex-46a31493a160",
+        "code-mod-kindex-c8ebc72bbedb"
+      ]
+    },
+    {
+      "id": "domain",
+      "name": "Domain",
+      "description": "Kindex-inferred domain layer.",
+      "nodeIds": [
+        "code-sym-kindex-05a1fbf0db2e",
+        "code-sym-kindex-0850aa56538b",
+        "code-sym-kindex-08e1ea9d3cda",
+        "code-sym-kindex-15261553fafb",
+        "code-sym-kindex-1ca6d2b3a552",
+        "code-sym-kindex-200aad86be36",
+        "code-sym-kindex-279e1c45cb06",
+        "code-sym-kindex-352d8c9bbdba",
+        "code-sym-kindex-36fe0270bb97",
+        "code-sym-kindex-415d46d7c508",
+        "code-sym-kindex-49ac56615e1e",
+        "code-sym-kindex-539e76b9be1f",
+        "code-sym-kindex-552c22e16187",
+        "code-sym-kindex-58d630bc994a",
+        "code-sym-kindex-608ef82e510c",
+        "code-sym-kindex-62490d9465aa",
+        "code-sym-kindex-74266f41225f",
+        "code-sym-kindex-78b780114b82",
+        "code-sym-kindex-7e4d614285e9",
+        "code-sym-kindex-89cc5b13c9e0",
+        "code-sym-kindex-95b8acd87972",
+        "code-sym-kindex-979d447616b7",
+        "code-sym-kindex-9d295ea2d8a3",
+        "code-sym-kindex-9f9f9fbe1087",
+        "code-sym-kindex-a8ad139fc733",
+        "code-sym-kindex-aa2ebf2ad1ea",
+        "code-sym-kindex-b166b6681594",
+        "code-sym-kindex-b404f7bbed67",
+        "code-sym-kindex-b42e459fa446",
+        "code-sym-kindex-b724908147cc",
+        "code-sym-kindex-b90676bdf42f",
+        "code-sym-kindex-c30edae67b27",
+        "code-sym-kindex-c644dbd33873",
+        "code-sym-kindex-fe4d5554b184"
+      ]
+    }
+  ],
+  "tour": [
+    {
+      "order": 1,
+      "title": "Core",
+      "description": "Review 42 node(s) in the Core layer.",
+      "nodeIds": [
+        "code-mod-kindex-086378eea6e0",
+        "code-mod-kindex-0c0f8066c77b",
+        "code-mod-kindex-0fae9ff61910",
+        "code-mod-kindex-1008402a94e8",
+        "code-mod-kindex-13363db31233",
+        "code-mod-kindex-1668da8a23a5",
+        "code-mod-kindex-1a589d0d4ff2",
+        "code-mod-kindex-1b467bb9761a",
+        "code-mod-kindex-1cc1824729d5",
+        "code-mod-kindex-1fd61a2a944a",
+        "code-mod-kindex-21dd45af3575",
+        "code-mod-kindex-26bb9b6e1fcb",
+        "code-mod-kindex-2ecdcb3c4276",
+        "code-mod-kindex-2fcd370316b8",
+        "code-mod-kindex-4af5ee17841c",
+        "code-mod-kindex-4d774506f9e3",
+        "code-mod-kindex-5998a0a5ca33",
+        "code-mod-kindex-5aa57e096c49",
+        "code-mod-kindex-62731532a556",
+        "code-mod-kindex-66df7720eed6",
+        "code-mod-kindex-6a3142a46050",
+        "code-mod-kindex-6a374a6f7fce",
+        "code-mod-kindex-702e4442e57e",
+        "code-mod-kindex-70d2128d6f82",
+        "code-mod-kindex-7ccf79c98767"
+      ]
+    },
+    {
+      "order": 2,
+      "title": "Data",
+      "description": "Review 2 node(s) in the Data layer.",
+      "nodeIds": [
+        "code-mod-kindex-46a31493a160",
+        "code-mod-kindex-c8ebc72bbedb"
+      ]
+    },
+    {
+      "order": 3,
+      "title": "Domain",
+      "description": "Review 34 node(s) in the Domain layer.",
+      "nodeIds": [
+        "code-sym-kindex-05a1fbf0db2e",
+        "code-sym-kindex-0850aa56538b",
+        "code-sym-kindex-08e1ea9d3cda",
+        "code-sym-kindex-15261553fafb",
+        "code-sym-kindex-1ca6d2b3a552",
+        "code-sym-kindex-200aad86be36",
+        "code-sym-kindex-279e1c45cb06",
+        "code-sym-kindex-352d8c9bbdba",
+        "code-sym-kindex-36fe0270bb97",
+        "code-sym-kindex-415d46d7c508",
+        "code-sym-kindex-49ac56615e1e",
+        "code-sym-kindex-539e76b9be1f",
+        "code-sym-kindex-552c22e16187",
+        "code-sym-kindex-58d630bc994a",
+        "code-sym-kindex-608ef82e510c",
+        "code-sym-kindex-62490d9465aa",
+        "code-sym-kindex-74266f41225f",
+        "code-sym-kindex-78b780114b82",
+        "code-sym-kindex-7e4d614285e9",
+        "code-sym-kindex-89cc5b13c9e0",
+        "code-sym-kindex-95b8acd87972",
+        "code-sym-kindex-979d447616b7",
+        "code-sym-kindex-9d295ea2d8a3",
+        "code-sym-kindex-9f9f9fbe1087",
+        "code-sym-kindex-a8ad139fc733"
+      ]
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import subprocess
 import sys
 
@@ -220,6 +221,35 @@ class TestStoreCRUD:
         assert len(due) == 1
         assert due[0]["title"] == "Past"
 
+    def test_scoped_due_reminders_filters_by_conversation(self, store):
+        from kindex.reminders import scoped_due_reminders
+
+        past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat(timespec="seconds")
+        chat_a = store.add_reminder(
+            "Chat A",
+            past,
+            extra={"conversation_id": "chat-a", "reminder_scope": "chat"},
+        )
+        chat_b = store.add_reminder(
+            "Chat B",
+            past,
+            extra={"conversation_id": "chat-b", "reminder_scope": "chat"},
+        )
+        legacy = store.add_reminder("Legacy", past)
+        global_id = store.add_reminder(
+            "Global",
+            past,
+            extra={"reminder_scope": "global"},
+        )
+
+        due = scoped_due_reminders(store, "chat-a")
+        ids = {r["id"] for r in due}
+
+        assert chat_a in ids
+        assert global_id in ids
+        assert chat_b not in ids
+        assert legacy not in ids
+
     def test_due_includes_snoozed_past(self, store):
         past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat(timespec="seconds")
         rid = store.add_reminder("Snoozed", past)
@@ -429,12 +459,12 @@ class TestAutoSnooze:
 # ── CLI ─────────────────────────────────────────────────────────────
 
 
-def _run_cli(*args, tmp_path=None):
+def _run_cli(*args, tmp_path=None, input_text=None):
     """Run kin CLI as subprocess."""
     cmd = [sys.executable, "-m", "kindex.cli"] + list(args)
     if tmp_path:
         cmd.extend(["--data-dir", str(tmp_path)])
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    return subprocess.run(cmd, input=input_text, capture_output=True, text=True, timeout=30)
 
 
 class TestReminderCLI:
@@ -459,6 +489,59 @@ class TestReminderCLI:
         result = _run_cli("remind", "check", tmp_path=tmp_path)
         assert result.returncode == 0
         assert "Checked:" in result.stdout
+
+    def test_prompt_check_uses_conversation_scoped_reminder_board(self, tmp_path):
+        cfg = Config(data_dir=str(tmp_path))
+        store = Store(cfg)
+        past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat(timespec="seconds")
+        store.add_reminder(
+            "Chat A reminder",
+            past,
+            extra={"conversation_id": "chat-a", "reminder_scope": "chat"},
+        )
+        store.add_reminder(
+            "Chat B reminder",
+            past,
+            extra={"conversation_id": "chat-b", "reminder_scope": "chat"},
+        )
+        store.add_reminder("Legacy reminder", past)
+        store.add_reminder("Global reminder", past, extra={"reminder_scope": "global"})
+        store.close()
+
+        result = _run_cli(
+            "prompt-check",
+            tmp_path=tmp_path,
+            input_text=json.dumps({"session_id": "chat-a", "prompt": "status"}),
+        )
+
+        assert result.returncode == 0
+        assert "Chat A reminder" in result.stdout
+        assert "Global reminder" in result.stdout
+        assert "Chat B reminder" not in result.stdout
+        assert "Legacy reminder" not in result.stdout
+
+    def test_remind_create_with_codex_wake_json(self, tmp_path):
+        result = _run_cli(
+            "remind", "create", "Continue build",
+            "--at", "in 30 minutes",
+            "--wake", "codex",
+            "--session", "last",
+            "--cwd", str(tmp_path),
+            "--wake-model", "gpt-5",
+            "--instructions", "Continue the outstanding build work.",
+            "--json",
+            tmp_path=tmp_path,
+        )
+
+        assert result.returncode == 0
+        reminder = json.loads(result.stdout)
+        extra = reminder["extra"]
+        assert extra["wake_client"] == "codex"
+        assert extra["wake_session_id"] == "last"
+        assert extra["wake_cwd"] == str(tmp_path)
+        assert extra["wake_model"] == "gpt-5"
+        assert extra["action_mode"] == "codex"
+        assert extra["action_status"] == "pending"
 
 
 # ── Actions ────────────────────────────────────────────────────────
@@ -490,6 +573,15 @@ class TestActionFields:
         r = store.get_reminder(rid)
         assert has_action(r)
 
+    def test_has_action_true_with_wake_client(self, store):
+        from kindex.actions import has_action
+        rid = store.add_reminder(
+            "Wake Codex", "2099-03-01T10:00:00",
+            extra={"wake_client": "codex", "action_status": "pending"},
+        )
+        r = store.get_reminder(rid)
+        assert has_action(r)
+
     def test_resolve_mode_auto_shell(self):
         from kindex.actions import resolve_mode
         assert resolve_mode({"action_command": "ls",
@@ -501,6 +593,11 @@ class TestActionFields:
         assert resolve_mode({"action_command": "ls",
                              "action_instructions": "check it",
                              "action_mode": "auto"}) == "claude"
+
+    def test_resolve_mode_auto_wake_client(self):
+        from kindex.actions import resolve_mode
+        assert resolve_mode({"wake_client": "opencode",
+                             "action_mode": "auto"}) == "opencode"
 
     def test_resolve_mode_explicit(self):
         from kindex.actions import resolve_mode
@@ -567,6 +664,75 @@ class TestExecuteShellAction:
         assert result["status"] == "skipped"
 
 
+class TestExecuteWakeActions:
+    def test_codex_wake_uses_exec_resume_last(self, store, config, monkeypatch, tmp_path):
+        from kindex.actions import execute_action
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="codex done", stderr="")
+
+        monkeypatch.setattr("kindex.actions.subprocess.run", fake_run)
+        rid = store.add_reminder(
+            "Continue Codex", "2099-03-01T10:00:00",
+            extra={
+                "wake_client": "codex",
+                "wake_session_id": "last",
+                "wake_cwd": str(tmp_path),
+                "wake_model": "gpt-5",
+                "action_instructions": "Pick up the interrupted task.",
+                "action_mode": "codex",
+                "action_status": "pending",
+            },
+        )
+        r = store.get_reminder(rid)
+        result = execute_action(store, r, config)
+
+        assert result["status"] == "completed"
+        assert seen["cmd"] == [
+            "codex", "exec", "--cd", str(tmp_path), "--model", "gpt-5",
+            "resume", "--last", "-",
+        ]
+        assert "Pick up the interrupted task." in seen["kwargs"]["input"]
+
+    def test_opencode_wake_uses_run_session(self, store, config, monkeypatch, tmp_path):
+        from kindex.actions import execute_action
+
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 0, stdout="opencode done", stderr="")
+
+        monkeypatch.setattr("kindex.actions.subprocess.run", fake_run)
+        rid = store.add_reminder(
+            "Continue OpenCode", "2099-03-01T10:00:00",
+            extra={
+                "wake_client": "opencode",
+                "wake_session_id": "ses_123",
+                "wake_cwd": str(tmp_path),
+                "wake_model": "anthropic/claude-sonnet-4-5",
+                "wake_agent": "build",
+                "action_instructions": "Continue the failing build triage.",
+                "action_mode": "opencode",
+                "action_status": "pending",
+            },
+        )
+        r = store.get_reminder(rid)
+        result = execute_action(store, r, config)
+
+        assert result["status"] == "completed"
+        assert seen["cmd"][:-1] == [
+            "opencode", "run", "--session", "ses_123", "--dir", str(tmp_path),
+            "--model", "anthropic/claude-sonnet-4-5", "--agent", "build",
+        ]
+        assert "Continue the failing build triage." in seen["cmd"][-1]
+
+
 class TestCreateReminderWithAction:
     def test_create_with_command(self, store):
         from kindex.reminders import create_reminder
@@ -595,6 +761,44 @@ class TestCreateReminderWithAction:
         rid = create_reminder(store, "Simple", "in 1 hour")
         r = store.get_reminder(rid)
         assert not r["extra"].get("action_command")
+
+    def test_create_with_conversation_scope(self, store):
+        from kindex.reminders import create_reminder
+        rid = create_reminder(
+            store,
+            "Review deployment",
+            "in 1 hour",
+            conversation_id="chat-a",
+            attention_triggers=["deploy"],
+        )
+        r = store.get_reminder(rid)
+        assert r["extra"]["conversation_id"] == "chat-a"
+        assert r["extra"]["reminder_scope"] == "chat"
+        assert r["extra"]["attention_triggers"] == ["deploy"]
+
+    def test_create_with_codex_wake(self, store, tmp_path):
+        from kindex.reminders import create_reminder
+        rid = create_reminder(
+            store,
+            "Wake Codex",
+            "in 1 hour",
+            action_instructions="Continue the current review.",
+            wake_client="codex",
+            wake_session_id="last",
+            wake_cwd=str(tmp_path),
+            wake_model="gpt-5",
+        )
+        r = store.get_reminder(rid)
+        assert r["extra"]["wake_client"] == "codex"
+        assert r["extra"]["wake_session_id"] == "last"
+        assert r["extra"]["wake_cwd"] == str(tmp_path)
+        assert r["extra"]["wake_model"] == "gpt-5"
+        assert r["extra"]["action_mode"] == "codex"
+
+    def test_create_rejects_unknown_wake_client(self, store):
+        from kindex.reminders import create_reminder
+        with pytest.raises(ValueError, match="Invalid wake client"):
+            create_reminder(store, "Bad wake", "in 1 hour", wake_client="cursor")
 
 
 class TestCheckAndFireWithActions:
@@ -648,6 +852,26 @@ class TestFormatReminderWithAction:
         assert "Action [shell]: pending" in output
         assert "Command: echo hello" in output
 
+    def test_format_shows_wake_info(self, store):
+        from kindex.reminders import format_reminder
+        rid = store.add_reminder(
+            "Wake action", "2099-03-01T10:00:00",
+            extra={
+                "wake_client": "opencode",
+                "wake_session_id": "last",
+                "wake_cwd": "/tmp/project",
+                "wake_agent": "build",
+                "action_mode": "opencode",
+                "action_status": "pending",
+            },
+        )
+        r = store.get_reminder(rid)
+        output = format_reminder(r)
+        assert "Action [opencode]: pending" in output
+        assert "Wake: opencode session=last" in output
+        assert "Cwd: /tmp/project" in output
+        assert "Agent: build" in output
+
     def test_format_shows_result_on_completed(self, store):
         from kindex.reminders import format_reminder
         rid = store.add_reminder(
@@ -664,6 +888,30 @@ class TestFormatReminderWithAction:
 class TestStopGuardCLI:
     def test_stop_guard_blocks_with_pending(self, tmp_path):
         import json as _json
+        cfg = tmp_path / "kin.yaml"
+        result = _run_cli(
+            "config", "set", "reminders.stop_guard_enabled", "true",
+            "--config", str(cfg),
+            tmp_path=tmp_path,
+        )
+        assert result.returncode == 0
+        result = _run_cli(
+            "remind", "create", "Kill instance",
+            "--at", "in 30 minutes",
+            "--action", "vastai destroy 123",
+            "--config", str(cfg),
+            tmp_path=tmp_path,
+        )
+        assert result.returncode == 0
+
+        result = _run_cli("stop-guard", "--config", str(cfg), tmp_path=tmp_path)
+        assert result.returncode == 0
+        assert result.stdout.strip()
+        data = _json.loads(result.stdout)
+        assert data["decision"] == "block"
+        assert "Kill instance" in data["message"]
+
+    def test_stop_guard_default_quiet_with_pending(self, tmp_path):
         result = _run_cli(
             "remind", "create", "Kill instance",
             "--at", "in 30 minutes",
@@ -674,13 +922,19 @@ class TestStopGuardCLI:
 
         result = _run_cli("stop-guard", tmp_path=tmp_path)
         assert result.returncode == 0
-        if result.stdout.strip():
-            data = _json.loads(result.stdout)
-            assert data["decision"] == "block"
-            assert "Kill instance" in data["message"]
+        assert result.stdout.strip() == ""
 
     def test_stop_guard_allows_without_pending(self, tmp_path):
         result = _run_cli("stop-guard", tmp_path=tmp_path)
+        assert result.returncode == 0
+        assert result.stdout.strip() == ""
+
+    def test_stop_guard_allows_recursive_stop_hook(self, tmp_path):
+        result = _run_cli(
+            "stop-guard",
+            tmp_path=tmp_path,
+            input_text='{"stop_hook_active": true}',
+        )
         assert result.returncode == 0
         assert result.stdout.strip() == ""
 

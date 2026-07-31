@@ -1,7 +1,8 @@
 """Kindex MCP Server — agent plugin for the knowledge graph.
 
 Exposes Kindex tools, resources, and prompts via the Model Context Protocol.
-Run with: kin-mcp (stdio transport, for Claude Code, Codex, and other MCP clients)
+Run with: kin-mcp (stdio transport, for Claude Code, Codex, Gemini CLI,
+Google Antigravity, OpenCode, Cursor, and other MCP clients)
 """
 
 from __future__ import annotations
@@ -48,18 +49,35 @@ mcp = FastMCP(
         "- checkpoint: pre-flight checklists — things to verify before an event\n\n"
 
         "## When to use each tool\n"
-        "- `search`: ALWAYS before adding (avoid duplicates) and when starting work on a topic\n"
-        "- `add`: capture discoveries as they happen — don't batch, don't wait\n"
+        "- `search`: ALWAYS before adding — if a matching node already exists, "
+        "prefer `edit`/`supersede` over `add` (edit, don't re-add)\n"
+        "- `add`: capture NEW discoveries as they happen — don't batch, don't wait\n"
+        "- `edit`: correct or extend an EXISTING node instead of re-adding a near "
+        "duplicate (additive types — decision/constraint/directive/checkpoint/watch — "
+        "accept append/expires only)\n"
+        "- `supersede`: replace an additive node when its content must actually change — "
+        "creates a fresh node linked via a supersedes edge, history preserved\n"
         "- `link`: when you notice two concepts relate — specify the relationship type "
         "(relates_to, depends_on, implements, contradicts, blocks, context_of)\n"
         "- `learn`: after reading long files/outputs — bulk-extracts multiple concepts at once\n"
         "- `task_add`: for work items — ALWAYS link to relevant concepts via link_to parameter\n"
+        "- `task_claim`/`task_release`: coordinate shared work with expiring task claims\n"
         "- `task_done`/`task_list`: manage tasks — they surface contextually via graph proximity\n"
+        "- `coord_start`/`coord_post`/`coord_read`/`coord_end`: short-lived agent coordination "
+        "state; capture durable discoveries separately with `add` or `learn`\n"
+        "- `coord_join`: become a member of a conversation — members get a read cursor "
+        "(unread tracking) and receive standing messages in their session context\n"
+        "- `coord_attach`: share a graph node with a conversation as a resource — "
+        "members see who holds it when it is locked\n"
+        "- `coord_inject`: set/clear/list standing messages pushed into member sessions "
+        "until cleared (use for 'don't touch X until Y lands')\n"
+        "- `lock_acquire`/`lock_release`: advisory node locks — `edit` refuses foreign "
+        "locks; locks expire by TTL, so an expired lock never blocks anyone\n"
         "- `watch_add`: for ONGOING monitoring — flaky tests, unstable APIs, items to revisit. "
         "Set owner and expires. Watches surface in every session's context automatically.\n"
         "- `watch_resolve`: when a watched issue is fixed or no longer relevant\n"
         "- `remind_create`: for TIME-BASED triggers — use `action` for shell commands, "
-        "`instructions` for Claude to follow when the reminder fires\n"
+        "`instructions` for Claude, or `wake` for Codex/OpenCode headless wakeups\n"
         "- `suggest`: check for bridge opportunities between disconnected graph clusters\n"
         "- `graph_heal`: diagnose graph health — find orphans, bridges, fading nodes\n"
         "- `graph_merge`: merge duplicate nodes (moves edges, archives source)\n"
@@ -90,6 +108,41 @@ def _get_store():
         _store = Store(_config)
         atexit.register(_store.close)
     return _store, _config
+
+
+def _get_config():
+    """Config from the lazy singleton (shares _get_store init)."""
+    _, config = _get_store()
+    return config
+
+
+def _default_agent(agent: str = "") -> str:
+    """Explicit agent name, or the resolved stable agent identity."""
+    if agent and agent.strip():
+        return agent.strip()
+    from .config import resolve_agent_id
+    return resolve_agent_id(_get_config())
+
+
+def _mcp_client() -> str | None:
+    """Client identity used to scope pulled context, from the KIN_CLIENT env.
+
+    A per-client MCP config (this server runs one instance per client) can set
+    KIN_CLIENT so context tools drop nodes scoped to a different client. Unset
+    means no scoping — the unchanged default.
+    """
+    from .agent_adapters import normalize_adapter
+    raw = os.environ.get("KIN_CLIENT") or os.environ.get("KINDEX_CLIENT")
+    return normalize_adapter(raw) if raw else None
+
+
+def _scope_results(results: list[dict], client: str | None) -> list[dict]:
+    """Drop search hits scoped to a different client, mirroring prime's retrieval
+    filter so context tools scope both search hits and operational nodes."""
+    if not client:
+        return results
+    from .agent_adapters import adapter_scoped_out
+    return [r for r in results if not adapter_scoped_out(r.get("tags"), client)]
 
 
 def _json(obj: Any, **kw) -> str:
@@ -270,6 +323,105 @@ def add(
 
 
 @mcp.tool()
+def edit(node_id: str, title: str = "", content: str = "", append: str = "",
+         add_tags: str = "", remove_tags: str = "", intent: str = "",
+         expires: str = "", force: bool = False) -> str:
+    """Edit a node in place (policy-aware). Accepts a node ID or exact title.
+
+    Edit classes by node type:
+    - editable (concept, document, artifact, skill, person, project, question):
+      every field below is allowed
+    - additive (decision, constraint, directive, checkpoint, watch): history
+      matters — only append and expires; use `supersede` to replace
+    - managed (task, session, coordination): refused — use the dedicated
+      task/session/coordination tools
+
+    Args:
+        node_id: Node ID or exact title.
+        title: Replace the title.
+        content: Replace the content.
+        append: Append a dated addendum block to the content.
+        add_tags: Comma-separated tags to add.
+        remove_tags: Comma-separated tags to remove.
+        intent: Replace the intent.
+        expires: Set an expiry date (YYYY-MM-DD) — expired nodes stop surfacing
+            and are archived by the daemon.
+        force: Override a foreign advisory lock.
+    """
+    store, config = _get_store()
+    from .store import EditPolicyError, LockHeldError
+
+    node = store.get_node(node_id) or store.get_node_by_title(node_id)
+    if not node:
+        return f"Node not found: {node_id}"
+
+    fields = {
+        "title": title or None,
+        "content": content or None,
+        "append": append or None,
+        "add_tags": [t.strip() for t in add_tags.split(",") if t.strip()] or None,
+        "remove_tags": [t.strip() for t in remove_tags.split(",") if t.strip()] or None,
+        "intent": intent or None,
+        "expires": expires or None,
+    }
+    provided = {k: v for k, v in fields.items() if v is not None}
+    if not provided:
+        return ("Error: edit requires at least one field (title, content, "
+                "append, add_tags, remove_tags, intent, expires).")
+
+    try:
+        updated = store.edit_node(
+            node["id"],
+            actor=_default_agent(),
+            force=force,
+            policy_overrides=config.edit_policy or None,
+            **provided,
+        )
+    except (EditPolicyError, LockHeldError, ValueError) as e:
+        return f"Error: {e}"
+
+    return (f"Edited {updated.get('title', '')} ({updated['id']}) — "
+            f"fields: {', '.join(sorted(provided))}")
+
+
+@mcp.tool()
+def supersede(node_id: str, new_text: str, expires: str = "", reason: str = "") -> str:
+    """Replace a node with a fresh one, preserving history. Accepts ID or title.
+
+    Creates a new node (same type/tags/audience/intent), links it with a
+    `supersedes` edge, marks the old node status='superseded', and migrates
+    its retrieval pheromone. Use this instead of `edit` for additive types
+    (decision, constraint, directive, checkpoint, watch) when the content
+    must change rather than grow.
+
+    Args:
+        node_id: Node ID or exact title of the node to replace.
+        new_text: Full replacement text (becomes title + content).
+        expires: Optional expiry date for the new node (YYYY-MM-DD).
+        reason: Why the node is being replaced (kept as provenance).
+    """
+    store, config = _get_store()
+    from .store import LockHeldError
+
+    node = store.get_node(node_id) or store.get_node_by_title(node_id)
+    if not node:
+        return f"Node not found: {node_id}"
+
+    try:
+        new = store.supersede_node(
+            node["id"], new_text,
+            actor=_default_agent(),
+            expires=expires or None,
+            reason=reason or None,
+            policy_overrides=config.edit_policy or None,
+        )
+    except (LockHeldError, ValueError) as e:
+        return f"Error: {e}"
+
+    return f"Superseded {node['title']} ({node['id']}) -> new node {new['id']}"
+
+
+@mcp.tool()
 def context(
     topic: str = "",
     level: str = "abridged",
@@ -284,12 +436,15 @@ def context(
     """
     store, _ = _get_store()
     from .retrieve import format_context_block, hybrid_search
+    from .store import node_expired
 
+    client = _mcp_client()
     if topic:
         results = hybrid_search(store, topic, top_k=15)
     else:
-        # Fall back to recent high-weight nodes
-        results = store.recent_nodes(n=15)
+        # Fall back to recent high-weight nodes (skip expired knowledge)
+        results = [r for r in store.recent_nodes(n=15) if not node_expired(r)]
+    results = _scope_results(results, client)
 
     if not results:
         return "No relevant knowledge found."
@@ -298,7 +453,7 @@ def context(
     if max_tokens > 0:
         kwargs = {"max_tokens_approx": max_tokens}
 
-    return format_context_block(store, results, query=topic, **kwargs)
+    return format_context_block(store, results, query=topic, adapter=client, **kwargs)
 
 
 @mcp.tool()
@@ -456,13 +611,14 @@ def ask(question: str) -> str:
         qtype = "exploratory"
 
     top_k = {"factual": 5, "procedural": 8, "decision": 10, "exploratory": 12}.get(qtype, 10)
-    results = hybrid_search(store, question, top_k=top_k)
+    client = _mcp_client()
+    results = _scope_results(hybrid_search(store, question, top_k=top_k), client)
 
     if not results:
         return f"[{qtype}] No relevant knowledge found for: {question}"
 
     level = "full" if qtype in ("procedural", "decision") else "abridged"
-    block = format_context_block(store, results, query=question, level=level)
+    block = format_context_block(store, results, query=question, level=level, adapter=client)
     return f"[{qtype} question]\n\n{block}"
 
 
@@ -489,6 +645,23 @@ def suggest(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _is_substantive_concept(concept: dict) -> bool:
+    """Reject empty or title-only extraction results.
+
+    The keyword-extraction fallback emits bare capitalized phrases / quoted
+    terms with no content and no domains. Historically these were created as
+    title-only concept nodes that linked to nothing and steadily inflated the
+    orphan count (the mcp-learn orphan bug). A concept is only worth a node if
+    it carries some information beyond a short title.
+    """
+    title = (concept.get("title") or "").strip()
+    if len(title) < 3:
+        return False
+    content = (concept.get("content") or "").strip()
+    domains = concept.get("domains") or []
+    return bool(content) or bool(domains)
+
+
 @mcp.tool()
 def learn(text: str) -> str:
     """Extract knowledge from text and add it to the graph.
@@ -498,7 +671,8 @@ def learn(text: str) -> str:
     for automatic concept extraction and linking.
 
     Analyzes the text for concepts, decisions, questions, and connections.
-    Creates nodes and links automatically.
+    Creates nodes and links automatically. Every extracted concept is grounded
+    to a source node so it can never orphan.
 
     Args:
         text: Text to extract knowledge from (session notes, documentation, etc.).
@@ -512,21 +686,51 @@ def learn(text: str) -> str:
 
     extraction = extract(text, existing, config, ledger)
 
-    created = 0
     linked = 0
 
-    for concept in extraction.get("concepts", [])[:10]:
+    # Reject low-information / empty extraction results before creating nodes.
+    concepts = [c for c in extraction.get("concepts", [])[:10]
+                if _is_substantive_concept(c)]
+    rejected = len(extraction.get("concepts", [])[:10]) - len(concepts)
+
+    created_ids: list[str] = []
+    grounded_ids: list[str] = []  # created + matched-existing, all linked to source
+
+    for concept in concepts:
         existing_node = store.get_node_by_title(concept["title"])
         if existing_node:
+            grounded_ids.append(existing_node["id"])
             continue
-        store.add_node(
+        nid = store.add_node(
             title=concept["title"],
             content=concept.get("content", ""),
             node_type=concept.get("type", "concept"),
             domains=concept.get("domains", []),
             prov_activity="mcp-learn",
         )
-        created += 1
+        created_ids.append(nid)
+        grounded_ids.append(nid)
+
+    created = len(created_ids)
+
+    # Ground every concept to a source node so newly created concepts never
+    # orphan, even when no connections are extracted. This is the structural
+    # fix for the mcp-learn orphan bug: provenance lives in the graph, not just
+    # in prov_activity.
+    if created_ids:
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        source_id = store.add_node(
+            title=f"Learned: {first_line[:72]}" if first_line else "Learned note",
+            content=text.strip()[:500],
+            node_type="document",
+            prov_activity="mcp-learn-source",
+            prov_why="source text passed to learn()",
+        )
+        for cid in grounded_ids:
+            store.add_edge(source_id, cid,
+                           edge_type="context_of",
+                           weight=0.4,
+                           provenance="extracted via learn()")
 
     for conn in extraction.get("connections", []):
         a = store.get_node_by_title(conn.get("from_title", ""))
@@ -552,6 +756,8 @@ def learn(text: str) -> str:
         )
 
     parts = [f"Extracted: {created} concept(s), {linked} link(s)"]
+    if rejected:
+        parts.append(f"{rejected} low-info concept(s) rejected")
     if decisions:
         parts.append(f"{len(decisions)} decision(s)")
     if questions:
@@ -672,18 +878,28 @@ def graph_heal() -> str:
 
 
 @mcp.tool()
-def graph_merge(source_id: str, target_id: str, keep: str = "target") -> str:
+def graph_merge(source_id: str, target_id: str, keep: str = "target",
+                force: bool = False) -> str:
     """Merge two nodes that represent the same concept.
 
     Moves all edges from the source node to the target node, then archives
     the source. Use when you find duplicate or near-duplicate nodes.
 
+    Policy-aware like `edit`: managed types (task, session, coordination)
+    are always refused — their tooling owns them. Additive types (decision,
+    constraint, directive, checkpoint, watch) are refused unless force=True
+    — prefer `supersede` so history survives. A foreign advisory lock on
+    either node blocks the merge unless force=True.
+
     Args:
         source_id: Node to merge FROM (will be archived).
         target_id: Node to merge INTO (will receive edges).
         keep: Which node to keep: 'target' (default) or 'source'.
+        force: Merge additive types / override a foreign lock.
     """
-    store, _ = _get_store()
+    store, config = _get_store()
+    from .schema import edit_class_for
+    from .store import LockHeldError
 
     if keep == "source":
         source_id, target_id = target_id, source_id
@@ -694,6 +910,28 @@ def graph_merge(source_id: str, target_id: str, keep: str = "target") -> str:
         return f"Source node not found: {source_id}"
     if not target:
         return f"Target node not found: {target_id}"
+
+    # Edit-policy chokepoint: graph_merge rewrites target content and
+    # archives the source, so it honors the same class policy as edit.
+    for node in (source, target):
+        ntype = node.get("type", "concept")
+        cls = edit_class_for(ntype, config.edit_policy or None)
+        if cls == "managed":
+            return (f"Error: node {node['id']} is type '{ntype}' (managed) — "
+                    f"merge is not allowed; use the dedicated "
+                    f"task/session/coordination tools")
+        if cls == "additive" and not force:
+            return (f"Error: node {node['id']} is type '{ntype}' (additive — "
+                    f"history matters); use supersede to replace it, or pass "
+                    f"force=True to merge anyway")
+
+    # Advisory locks on either node block the merge (force overrides).
+    actor = _default_agent()
+    try:
+        store._check_lock(source, actor, force)
+        store._check_lock(target, actor, force)
+    except LockHeldError as e:
+        return f"Error: {e}"
 
     # Move edges from source to target
     moved = 0
@@ -724,9 +962,21 @@ def graph_merge(source_id: str, target_id: str, keep: str = "target") -> str:
     target_weight = target.get("weight", 0.5)
     store.update_node(target_id, weight=min(1.0, max(target_weight, source_weight)))
 
-    # Archive source
+    # Archive source — preserve its extra (lock, claim, expiry, ...) and
+    # only annotate the merge, mirroring supersede_node.
+    source_extra = dict(source.get("extra") or {})
+    source_extra["merged_into"] = target_id
     store.update_node(source_id, status="archived", weight=0.01,
-                      extra={"merged_into": target_id})
+                      extra=source_extra)
+
+    # Migrate retrieval pheromone so learned trails follow the merge
+    # (same statement as supersede_node).
+    store.conn.execute(
+        "UPDATE OR REPLACE injection_pheromone SET node_id = ? "
+        "WHERE node_id = ?",
+        (target_id, source_id),
+    )
+    store.conn.commit()
 
     return (f"Merged '{source['title']}' into '{target['title']}': "
             f"{moved} edges moved, source archived.")
@@ -788,27 +1038,41 @@ def changelog(since: str = "", days: int = 7) -> str:
     if not entries:
         return f"No changes since {since_iso}."
 
+    def _compact(value, limit=60):
+        if value is None or value == "":
+            return "(none)"
+        s = value if isinstance(value, str) else _json(value)
+        s = " ".join(s.split())
+        return s if len(s) <= limit else s[:limit - 1] + "…"
+
     lines = [f"{len(entries)} change(s) since {since_iso}:\n"]
     for e in entries[:50]:
         ts = e.get("timestamp", "?")[:19]
         action = e.get("action", "?")
-        target = e.get("node_id", "?")
+        target = e.get("target_title") or e.get("target_id") or "?"
         actor = e.get("actor", "")
-        detail = e.get("detail", "")
+        details = e.get("details") or {}
         actor_str = f" by {actor}" if actor else ""
         lines.append(f"  {ts} {action} {target}{actor_str}")
-        if detail:
-            lines.append(f"    {detail[:80]}")
+        # Compact per-field diff lines for edits
+        diffs = details.get("diffs") if isinstance(details, dict) else None
+        if isinstance(diffs, dict):
+            for field, change in diffs.items():
+                if not isinstance(change, dict):
+                    continue
+                lines.append(f"    {field}: {_compact(change.get('old'))} "
+                             f"-> {_compact(change.get('new'))}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def ingest(source: str, limit: int = 50, repo: str = "", since: str = "") -> str:
+def ingest(source: str, limit: int = 0, repo: str = "", since: str = "") -> str:
     """Ingest knowledge from external sources.
 
     Args:
         source: Adapter name (github, linear, files, commits, projects, sessions) or 'all'.
-        limit: Maximum items to ingest per adapter.
+        limit: Maximum items to ingest per adapter (0 = each adapter's own default;
+            code is unlimited, network/LLM adapters cap at 50).
         repo: GitHub owner/repo for github adapter (e.g. 'jmcentire/kindex').
         since: ISO date — only ingest items after this date.
     """
@@ -816,7 +1080,9 @@ def ingest(source: str, limit: int = 50, repo: str = "", since: str = "") -> str
     from .adapters.registry import discover, get
 
     store, cfg = _get_store()
-    config = IngestConfig(since=since or None, limit=limit, verbose=False)
+    config = IngestConfig(since=since or None,
+                          limit=limit if limit > 0 else None,
+                          verbose=False)
     extra: dict = {"_config": cfg}
     if repo:
         extra["repo"] = repo
@@ -894,11 +1160,14 @@ def prime(topic: str = "") -> str:
     """
     store, _ = _get_store()
     from .retrieve import format_context_block, hybrid_search
+    from .store import node_expired
 
+    client = _mcp_client()
     if topic:
         results = hybrid_search(store, topic, top_k=15)
     else:
-        results = store.recent_nodes(n=15)
+        results = [r for r in store.recent_nodes(n=15) if not node_expired(r)]
+    results = _scope_results(results, client)
 
     if not results:
         return "No knowledge available for priming."
@@ -908,7 +1177,7 @@ def prime(topic: str = "") -> str:
         f"# Kindex Context\n\n"
         f"Graph: {stats.get('node_count', 0)} nodes, {stats.get('edge_count', 0)} edges\n\n"
     )
-    block = format_context_block(store, results, query=topic, level="full")
+    block = format_context_block(store, results, query=topic, level="full", adapter=client)
     return header + block
 
 
@@ -974,6 +1243,42 @@ def tag_start(name: str, description: str = "", focus: str = "",
         return f"Error: {e}"
 
 
+def _reinforce_on_end(store, config, tag_name: str, summary: str) -> str:
+    """Private helper (NOT an MCP tool — it takes store/config directly).
+
+    Silently queue this session for later reinforcement grading (no LLM, no
+    output here — the grading runs off the critical path in cron). Uses the
+    summary + segment history as the trace; a Stop hook's full transcript, if
+    present, supersedes it. Returns '' always — kin stays transparent. Never raises.
+    """
+    try:
+        if not config.attention.reinforce_enabled:
+            return ""
+        from .attention import resolve_conversation_id
+        from .sessions import get_tag
+        from .reinforce import enqueue_reinforce
+
+        conversation_id = resolve_conversation_id(fallback_to_cwd=False)
+        if not conversation_id:
+            return ""
+
+        parts = [summary] if summary else []
+        tag = get_tag(store, tag_name)
+        if tag:
+            parts.append(tag.get("content", "") or "")
+            for seg in (tag.get("extra") or {}).get("segments", []) or []:
+                if seg.get("focus"):
+                    parts.append(f"focus: {seg['focus']}")
+                if seg.get("summary"):
+                    parts.append(seg["summary"])
+        trace = "\n".join(p for p in parts if p).strip()
+        if trace:
+            enqueue_reinforce(store, conversation_id, trace=trace)
+    except Exception:
+        pass
+    return ""
+
+
 @mcp.tool()
 def tag_update(name: str = "", focus: str = "", description: str = "",
                remaining: str = "", add_remaining: str = "",
@@ -991,7 +1296,7 @@ def tag_update(name: str = "", focus: str = "", description: str = "",
         summary: Summary for segment/pause/end actions.
         action: One of: update, segment, pause, end.
     """
-    store, _ = _get_store()
+    store, config = _get_store()
     from .sessions import (update_tag, add_segment, pause_tag,
                            complete_tag, get_active_tag, get_tag)
     import os
@@ -1021,7 +1326,8 @@ def tag_update(name: str = "", focus: str = "", description: str = "",
             return f"Paused: {name}"
         elif action == "end":
             complete_tag(store, name, summary=summary)
-            return f"Completed: {name}"
+            note = _reinforce_on_end(store, config, name, summary)
+            return f"Completed: {name}{note}"
         return f"Unknown action: {action}"
     except ValueError as e:
         return f"Error: {e}"
@@ -1138,6 +1444,309 @@ def task_done(id: str) -> str:
     return f"Task not found: {id}"
 
 
+@mcp.tool()
+def task_claim(id: str, agent: str = "", ttl_minutes: int = 120,
+               note: str = "", force: bool = False) -> str:
+    """Claim a task for an agent with an expiry.
+
+    Args:
+        id: Task node ID.
+        agent: Agent/sub-agent name claiming the task (default: resolved agent id).
+        ttl_minutes: Claim TTL. Expired claims can be taken over.
+        note: Optional claim note.
+        force: Override an existing unexpired claim.
+    """
+    store, _ = _get_store()
+    from .tasks import claim_task
+    try:
+        result = claim_task(
+            store, id, _default_agent(agent),
+            ttl_minutes=ttl_minutes,
+            note=note,
+            force=force,
+        )
+    except ValueError as e:
+        return f"Could not claim task: {e}"
+    if not result:
+        return f"Task not found: {id}"
+    claim = (result.get("extra") or {}).get("claim") or {}
+    return (
+        f"Claimed task: {result['title']} ({id}) by {claim.get('agent')} "
+        f"until {claim.get('expires_at')}"
+    )
+
+
+@mcp.tool()
+def task_release(id: str, agent: str = "", force: bool = False) -> str:
+    """Release a task claim.
+
+    Args:
+        id: Task node ID.
+        agent: Agent name. Required to match the claim unless force is true.
+        force: Release even if the agent does not match.
+    """
+    store, _ = _get_store()
+    from .tasks import release_task_claim
+    try:
+        result = release_task_claim(store, id, agent=agent, force=force)
+    except ValueError as e:
+        return f"Could not release task claim: {e}"
+    if not result:
+        return f"Task not found: {id}"
+    return f"Released task claim: {result['title']} ({id})"
+
+
+# ── Coordination ─────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def coord_start(name: str, task_id: str = "", agent: str = "",
+                ttl_minutes: int = 240) -> str:
+    """Start a short-lived coordination conversation.
+
+    Args:
+        name: Conversation name.
+        task_id: Optional related task ID.
+        agent: Agent creating the conversation (default: resolved agent id).
+        ttl_minutes: Conversation TTL. Expired conversations are cleaned up.
+    """
+    store, _ = _get_store()
+    from .coordination import create_conversation
+    try:
+        conv_id = create_conversation(
+            store,
+            name,
+            task_id=task_id or None,
+            ttl_minutes=ttl_minutes,
+            created_by=_default_agent(agent),
+        )
+    except ValueError as e:
+        return f"Could not start coordination conversation: {e}"
+    return f"Started coordination conversation: {conv_id} ({name})"
+
+
+@mcp.tool()
+def coord_join(name: str, agent: str = "") -> str:
+    """Join a coordination conversation as a member.
+
+    Members get read cursors (unread tracking) and receive standing inject
+    messages in their session context. Idempotent.
+
+    Args:
+        name: Conversation ID or name.
+        agent: Joining agent name (default: resolved agent id).
+    """
+    store, _ = _get_store()
+    from .coordination import join_conversation
+    try:
+        member = join_conversation(store, name, _default_agent(agent))
+    except ValueError as e:
+        return f"Could not join conversation: {e}"
+    return f"Joined {name} as {member['agent']}"
+
+
+@mcp.tool()
+def coord_post(conversation: str, agent: str = "", message: str = "",
+               to: str = "") -> str:
+    """Post a message to a coordination conversation.
+
+    Args:
+        conversation: Conversation ID or name.
+        agent: Posting agent name (default: resolved agent id).
+        message: Message body.
+        to: Optional target agent — message is delivered (unread counts,
+            injection) only to them; broadcast when empty.
+    """
+    store, _ = _get_store()
+    from .coordination import post_message
+    try:
+        msg = post_message(store, conversation, _default_agent(agent), message,
+                           to=to or None)
+    except ValueError as e:
+        return f"Could not post coordination message: {e}"
+    return f"Posted coordination message #{msg['id']} to {conversation}"
+
+
+@mcp.tool()
+def coord_read(conversation: str, since_id: int = 0, limit: int = 50,
+               agent: str = "") -> str:
+    """Read messages from a coordination conversation.
+
+    Advances the reading agent's member cursor (unread tracking).
+
+    Args:
+        conversation: Conversation ID or name.
+        since_id: Only return messages with a higher id.
+        limit: Maximum messages to return.
+        agent: Reading agent name (default: resolved agent id).
+    """
+    store, _ = _get_store()
+    from .coordination import format_messages, read_messages
+    try:
+        payload = read_messages(store, conversation, since_id=since_id,
+                                limit=limit, agent=_default_agent(agent))
+    except ValueError as e:
+        return f"Could not read coordination conversation: {e}"
+    return format_messages(payload)
+
+
+@mcp.tool()
+def coord_attach(name: str, node_id: str) -> str:
+    """Attach a graph node to a conversation as a shared resource.
+
+    Attached resources surface in members' contexts when locked, so agents
+    see who holds what.
+
+    Args:
+        name: Conversation ID or name.
+        node_id: Node ID or title to attach.
+    """
+    store, _ = _get_store()
+    from .coordination import attach_resource
+    node = store.get_node(node_id) or store.get_node_by_title(node_id)
+    try:
+        resources = attach_resource(store, name,
+                                    node["id"] if node else node_id)
+    except ValueError as e:
+        return f"Could not attach resource: {e}"
+    return f"Attached. Resources on {name}: {', '.join(resources)}"
+
+
+@mcp.tool()
+def coord_inject(name: str, action: str = "list", text: str = "",
+                 to: str = "", message_id: int = 0) -> str:
+    """Manage standing inject messages on a coordination conversation.
+
+    Inject messages are pushed into member agents' session context by the
+    prime/prompt hooks until cleared.
+
+    Args:
+        name: Conversation ID or name.
+        action: set, clear, or list.
+        text: Message text (for set).
+        to: Optional target agent (for set); broadcast when empty.
+        message_id: Specific inject message id to clear (0 = clear all).
+    """
+    store, _ = _get_store()
+    from .coordination import (
+        clear_inject_messages,
+        list_inject_messages,
+        set_inject_message,
+    )
+    try:
+        if action == "set":
+            entry = set_inject_message(store, name, text, _default_agent(),
+                                       to=to or None)
+            target = f" -> {entry['to']}" if entry.get("to") else ""
+            return f"Set inject message #{entry['id']}{target} on {name}"
+        if action == "clear":
+            count = clear_inject_messages(
+                store, name, message_id=message_id or None)
+            return f"Cleared {count} inject message(s) on {name}"
+        if action == "list":
+            msgs = list_inject_messages(store, name)
+            if not msgs:
+                return f"No inject messages on {name}."
+            lines = [f"Inject messages on {name}:"]
+            for m in msgs:
+                target = f" -> {m['to']}" if m.get("to") else ""
+                lines.append(f"  #{m.get('id')} {m.get('created_at')} "
+                             f"{m.get('set_by')}{target}: {m.get('text')}")
+            return "\n".join(lines)
+    except ValueError as e:
+        return f"Could not manage inject messages: {e}"
+    return f"Unknown inject action: {action} (use set, clear, or list)"
+
+
+@mcp.tool()
+def coord_list(status: str = "active", task_id: str = "") -> str:
+    """List coordination conversations.
+
+    Args:
+        status: active, ended, or all.
+        task_id: Optional related task ID filter.
+    """
+    store, _ = _get_store()
+    from .coordination import format_conversations, list_conversations
+    conversations = list_conversations(
+        store,
+        status=status,
+        task_id=task_id or None,
+    )
+    return format_conversations(conversations)
+
+
+@mcp.tool()
+def coord_end(conversation: str, summary: str = "") -> str:
+    """End a coordination conversation and clear transient messages.
+
+    Args:
+        conversation: Conversation ID or name.
+        summary: Optional retained summary.
+    """
+    store, _ = _get_store()
+    from .coordination import end_conversation
+    result = end_conversation(store, conversation, summary=summary)
+    if not result:
+        return f"Conversation not found: {conversation}"
+    return f"Ended coordination conversation: {conversation}"
+
+
+# ── Locks ────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def lock_acquire(node_id: str, ttl_minutes: int = 60, note: str = "",
+                 force: bool = False) -> str:
+    """Acquire an advisory lock on a node for the current agent.
+
+    Locks are advisory: they signal "I am working on this" to other agents
+    (edit refusal, collab context). Expired locks never block anyone.
+
+    Args:
+        node_id: Node ID or title to lock.
+        ttl_minutes: Lock TTL. Re-acquiring refreshes it.
+        note: Why the node is locked.
+        force: Take over a foreign unexpired lock.
+    """
+    store, _ = _get_store()
+    from .locks import lock_node
+    from .store import LockHeldError
+    node = store.get_node(node_id) or store.get_node_by_title(node_id)
+    if not node:
+        return f"Node not found: {node_id}"
+    try:
+        lock = lock_node(store, node["id"], _default_agent(),
+                         ttl_minutes=ttl_minutes, note=note, force=force)
+    except (LockHeldError, ValueError) as e:
+        return f"Could not lock node: {e}"
+    return (f"Locked {node['title']} ({node['id']}) for {lock['agent']} "
+            f"until {lock['expires_at']}")
+
+
+@mcp.tool()
+def lock_release(node_id: str, force: bool = False) -> str:
+    """Release an advisory lock held on a node.
+
+    Args:
+        node_id: Node ID or title to unlock.
+        force: Clear a lock held by another agent.
+    """
+    store, _ = _get_store()
+    from .locks import unlock_node
+    from .store import LockHeldError
+    node = store.get_node(node_id) or store.get_node_by_title(node_id)
+    if not node:
+        return f"Node not found: {node_id}"
+    try:
+        cleared = unlock_node(store, node["id"], _default_agent(), force=force)
+    except LockHeldError as e:
+        return f"Could not unlock node: {e}"
+    if cleared:
+        return f"Unlocked {node['title']} ({node['id']})"
+    return f"No lock on {node['title']} ({node['id']})"
+
+
 # ── Watches ──────────────────────────────────────────────────────────
 
 
@@ -1239,10 +1848,14 @@ def watch_resolve(id: str, reason: str = "") -> str:
     if not node or node.get("type") != "watch":
         return f"Watch not found: {id}"
 
-    extra = node.get("extra") or {}
-    extra["resolved_reason"] = reason
-    extra["watch_status"] = "resolved"
-    store.update_node(id, status="archived", extra=extra, weight=0.01)
+    def _mutate(extra: dict) -> None:
+        extra["resolved_reason"] = reason
+        extra["watch_status"] = "resolved"
+
+    # Atomic extra mutation first, then the status/weight flip without
+    # passing extra — a concurrent extra writer is never clobbered.
+    store.atomic_extra_update(id, _mutate)
+    store.update_node(id, status="archived", weight=0.01)
     return f"Resolved watch: {node['title']} ({id})"
 
 
@@ -1252,7 +1865,10 @@ def watch_resolve(id: str, reason: str = "") -> str:
 @mcp.tool()
 def remind_create(text: str, when: str, priority: str = "normal",
                   channels: str = "", action: str = "",
-                  instructions: str = "") -> str:
+                  instructions: str = "", conversation_id: str = "",
+                  scope: str = "chat", wake: str = "",
+                  wake_session: str = "", wake_cwd: str = "",
+                  wake_model: str = "", wake_agent: str = "") -> str:
     """Create a reminder with natural language time parsing.
 
     Args:
@@ -1262,20 +1878,43 @@ def remind_create(text: str, when: str, priority: str = "normal",
         channels: Comma-separated notification channels (system, slack, email, claude).
         action: Shell command to execute when the reminder fires (optional).
         instructions: Natural language instructions for Claude to follow when due (optional).
+        conversation_id: Optional chat/session id for scoped hook injection.
+        scope: Reminder visibility for hook injection: chat or global.
+        wake: Wake an agent when due: codex or opencode.
+        wake_session: Optional host session id to resume; use 'last' for latest.
+        wake_cwd: Optional working directory for the wake run.
+        wake_model: Optional model override for the wake run.
+        wake_agent: Optional OpenCode agent override for the wake run.
     """
     store, config = _get_store()
     from .reminders import create_reminder
     channel_list = [c.strip() for c in channels.split(",") if c.strip()] if channels else None
+    if scope == "chat" and not conversation_id:
+        try:
+            from .attention import resolve_conversation_id
+            conversation_id = resolve_conversation_id(fallback_to_cwd=False)
+        except Exception:
+            conversation_id = ""
+    effective_scope = "global" if scope == "global" else ("chat" if conversation_id else "")
     try:
         rid = create_reminder(
             store, text, when,
             priority=priority, channels=channel_list,
             action_command=action,
             action_instructions=instructions,
+            wake_client=wake,
+            wake_session_id=wake_session,
+            wake_cwd=wake_cwd,
+            wake_model=wake_model,
+            wake_agent=wake_agent,
+            conversation_id=conversation_id,
+            scope=effective_scope,
         )
         r = store.get_reminder(rid)
         action_info = ""
-        if action or instructions:
+        if wake:
+            action_info = f", action: wake:{wake}"
+        elif action or instructions:
             action_info = f", action: {'shell' if action and not instructions else 'claude'}"
         return f"Created reminder: {rid} (next due: {r['next_due']}{action_info})"
     except ValueError as e:
@@ -1371,7 +2010,7 @@ def remind_exec(id: str) -> str:
         return f"Error: Reminder not found: {id}"
     if not has_action(r):
         return f"Error: Reminder {id} has no action defined."
-    result = execute_action(store, r, config)
+    result = execute_action(store, r, config, manual=True)
     return f"Action {result['status']}: {result.get('output', '')[:500]}"
 
 

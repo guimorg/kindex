@@ -48,6 +48,29 @@ class TestSetupHooks:
         assert "hooks" in data
         assert "SessionStart" in data["hooks"]
         assert "UserPromptSubmit" in data["hooks"]
+        assert "PreToolUse" in data["hooks"]
+        assert "attention-hook" in str(data["hooks"]["PreToolUse"])
+        assert "Stop" in data["hooks"]
+        assert "stop-guard" not in str(data["hooks"]["Stop"])
+        assert "compact-hook" in str(data["hooks"]["Stop"])
+        assert "dream" in str(data["hooks"]["Stop"])
+
+    def test_setup_hooks_can_disable_stop_dream(self, tmp_path):
+        """Should omit stop-time dream when explicitly disabled."""
+        from kindex.setup import install_claude_hooks
+
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings = claude_dir / "settings.json"
+        settings.write_text("{}")
+
+        cfg = Config(data_dir=str(tmp_path), claude_dir=str(claude_dir))
+        cfg.reminders.dream_on_stop_enabled = False
+        install_claude_hooks(cfg)
+
+        data = json.loads(settings.read_text())
+        assert "compact-hook" in str(data["hooks"]["Stop"])
+        assert "dream" not in str(data["hooks"]["Stop"])
 
     def test_setup_hooks_idempotent(self, tmp_path):
         """Installing twice should not duplicate hooks."""
@@ -167,6 +190,412 @@ class TestSetupCodex:
         assert "[mcp_servers.kindex]" not in text
         assert "[mcp_servers.other]" in text
         assert 'trust_level = "trusted"' in text
+
+    def test_setup_codex_hooks_installs(self, tmp_path):
+        """Should install Kindex prompt hook into Codex hooks.json."""
+        from kindex.setup import install_codex_hooks
+
+        codex_dir = tmp_path / ".codex"
+        codex_dir.mkdir()
+        hooks_path = codex_dir / "hooks.json"
+        hooks_path.write_text(json.dumps({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "echo done"}]}],
+            },
+        }))
+
+        cfg = Config(data_dir=str(tmp_path), codex_dir=str(codex_dir))
+        actions = install_codex_hooks(cfg)
+
+        assert any("Codex UserPromptSubmit" in a for a in actions)
+        assert any("Codex PostToolUse" in a for a in actions)
+        assert any("Codex SessionStart" in a for a in actions)
+        data = json.loads(hooks_path.read_text())
+        assert "Stop" in data["hooks"]
+        prompt_hooks = data["hooks"]["UserPromptSubmit"]
+        assert len(prompt_hooks) == 1
+        assert "attention-hook" in prompt_hooks[0]["hooks"][0]["command"]
+        assert "--deadline-ms 3500" in prompt_hooks[0]["hooks"][0]["command"]
+        assert "--adapter" in prompt_hooks[0]["hooks"][0]["command"]
+        assert "source ~/.profile" in prompt_hooks[0]["hooks"][0]["command"]
+        post_hooks = data["hooks"]["PostToolUse"]
+        assert len(post_hooks) == 1
+        assert "attention-hook" in post_hooks[0]["hooks"][0]["command"]
+        assert "--deadline-ms 3500" in post_hooks[0]["hooks"][0]["command"]
+        # SessionStart hook injects the prime block (parity with Claude) via the
+        # codex adapter so Codex gets the directive + .kin guidance at startup.
+        session_hooks = data["hooks"]["SessionStart"]
+        assert len(session_hooks) == 1
+        session_cmd = session_hooks[0]["hooks"][0]["command"]
+        assert "prime" in session_cmd and "--for hook" in session_cmd
+        assert "--adapter codex" in session_cmd
+        assert "source ~/.profile" in session_cmd
+
+    def test_setup_codex_hooks_idempotent(self, tmp_path):
+        """Installing twice should not duplicate Codex prompt hook."""
+        from kindex.setup import install_codex_hooks
+
+        codex_dir = tmp_path / ".codex"
+        cfg = Config(data_dir=str(tmp_path), codex_dir=str(codex_dir))
+
+        install_codex_hooks(cfg)
+        actions2 = install_codex_hooks(cfg)
+
+        assert any("already installed" in a for a in actions2)
+        data = json.loads((codex_dir / "hooks.json").read_text())
+        assert len(data["hooks"]["UserPromptSubmit"]) == 1
+        assert len(data["hooks"]["PostToolUse"]) == 1
+        assert len(data["hooks"]["SessionStart"]) == 1
+
+    def test_uninstall_codex_hooks_preserves_other_hooks(self, tmp_path):
+        """Uninstall should remove only Kindex prompt-check hooks."""
+        from kindex.setup import install_codex_hooks, uninstall_codex_hooks
+
+        codex_dir = tmp_path / ".codex"
+        codex_dir.mkdir()
+        hooks_path = codex_dir / "hooks.json"
+        hooks_path.write_text(json.dumps({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {"hooks": [{"type": "command", "command": "echo other"}]},
+                ],
+            },
+        }))
+        cfg = Config(data_dir=str(tmp_path), codex_dir=str(codex_dir))
+        install_codex_hooks(cfg)
+        actions = uninstall_codex_hooks(cfg)
+
+        assert any("Removed" in a for a in actions)
+        data = json.loads(hooks_path.read_text())
+        prompt_hooks = data["hooks"]["UserPromptSubmit"]
+        assert len(prompt_hooks) == 1
+        assert prompt_hooks[0]["hooks"][0]["command"] == "echo other"
+        assert "PostToolUse" not in data["hooks"]
+        assert "SessionStart" not in data["hooks"]
+
+    def test_setup_codex_hooks_cli_dry_run(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        r = run("setup-codex-hooks", "--dry-run", data_dir=d)
+        assert r.returncode == 0
+
+
+class TestSetupGemini:
+    def test_install_gemini_mcp_writes_settings(self, tmp_path):
+        from kindex.setup import install_gemini_mcp
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        settings = gemini_dir / "settings.json"
+        settings.write_text(json.dumps({"theme": "dark"}))
+
+        cfg = Config(data_dir=str(tmp_path), gemini_dir=str(gemini_dir))
+        actions = install_gemini_mcp(cfg)
+
+        assert any("Gemini MCP" in a for a in actions)
+        data = json.loads(settings.read_text())
+        assert data["theme"] == "dark"
+        assert data["mcpServers"]["kindex"] == {"command": "kin-mcp", "args": []}
+
+    def test_install_gemini_mcp_idempotent(self, tmp_path):
+        from kindex.setup import install_gemini_mcp
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        cfg = Config(data_dir=str(tmp_path), gemini_dir=str(gemini_dir))
+
+        install_gemini_mcp(cfg)
+        actions2 = install_gemini_mcp(cfg)
+
+        assert any("already installed" in a for a in actions2)
+
+    def test_install_gemini_mcp_dry_run_does_not_write(self, tmp_path):
+        from kindex.setup import install_gemini_mcp
+
+        gemini_dir = tmp_path / ".gemini"
+        cfg = Config(data_dir=str(tmp_path), gemini_dir=str(gemini_dir))
+        actions = install_gemini_mcp(cfg, dry_run=True)
+        assert any("Would add" in a for a in actions)
+        assert not (gemini_dir / "settings.json").exists()
+
+    def test_uninstall_gemini_mcp_preserves_other_servers(self, tmp_path):
+        from kindex.setup import uninstall_gemini_mcp
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        settings = gemini_dir / "settings.json"
+        settings.write_text(json.dumps({
+            "theme": "dark",
+            "mcpServers": {
+                "kindex": {"command": "kin-mcp", "args": []},
+                "other": {"command": "other-mcp", "args": ["--x"]},
+            },
+        }))
+
+        cfg = Config(data_dir=str(tmp_path), gemini_dir=str(gemini_dir))
+        actions = uninstall_gemini_mcp(cfg)
+
+        assert any("Removed" in a for a in actions)
+        data = json.loads(settings.read_text())
+        assert "kindex" not in data["mcpServers"]
+        assert "other" in data["mcpServers"]
+        assert data["theme"] == "dark"
+
+    def test_setup_gemini_mcp_cli_dry_run(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        r = run("setup-gemini-mcp", "--dry-run", data_dir=d)
+        assert r.returncode == 0
+
+
+class TestSetupAntigravity:
+    def test_install_antigravity_mcp_writes_both_global_configs(self, tmp_path):
+        from kindex.setup import install_antigravity_mcp
+
+        ag_dir = tmp_path / ".gemini" / "config"
+        cli_dir = tmp_path / ".gemini" / "antigravity-cli"
+        ag_dir.mkdir(parents=True)
+        editor_config = ag_dir / "mcp_config.json"
+        editor_config.write_text(json.dumps({
+            "mcpServers": {
+                "other": {"command": "other-mcp"},
+            },
+        }))
+
+        cfg = Config(
+            data_dir=str(tmp_path),
+            antigravity_dir=str(ag_dir),
+            antigravity_cli_dir=str(cli_dir),
+        )
+        actions = install_antigravity_mcp(cfg)
+
+        assert any("Antigravity editor/shared" in a for a in actions)
+        assert any("Antigravity CLI" in a for a in actions)
+        editor = json.loads(editor_config.read_text())
+        cli = json.loads((cli_dir / "mcp_config.json").read_text())
+        assert editor["mcpServers"]["other"] == {"command": "other-mcp"}
+        assert editor["mcpServers"]["kindex"] == {"command": "kin-mcp", "args": []}
+        assert cli["mcpServers"]["kindex"] == {"command": "kin-mcp", "args": []}
+
+    def test_uninstall_antigravity_mcp_preserves_other_servers(self, tmp_path):
+        from kindex.setup import uninstall_antigravity_mcp
+
+        ag_dir = tmp_path / ".gemini" / "config"
+        cli_dir = tmp_path / ".gemini" / "antigravity-cli"
+        ag_dir.mkdir(parents=True)
+        cli_dir.mkdir(parents=True)
+        for path in (ag_dir / "mcp_config.json", cli_dir / "mcp_config.json"):
+            path.write_text(json.dumps({
+                "mcpServers": {
+                    "kindex": {"command": "kin-mcp", "args": []},
+                    "other": {"command": "other-mcp"},
+                },
+            }))
+
+        cfg = Config(
+            data_dir=str(tmp_path),
+            antigravity_dir=str(ag_dir),
+            antigravity_cli_dir=str(cli_dir),
+        )
+        actions = uninstall_antigravity_mcp(cfg)
+
+        assert any("Removed" in a for a in actions)
+        for path in (ag_dir / "mcp_config.json", cli_dir / "mcp_config.json"):
+            data = json.loads(path.read_text())
+            assert "kindex" not in data["mcpServers"]
+            assert "other" in data["mcpServers"]
+
+    def test_install_antigravity_hooks_writes_schema(self, tmp_path):
+        from kindex.setup import install_antigravity_hooks
+
+        ag_dir = tmp_path / ".gemini" / "config"
+        ag_dir.mkdir(parents=True)
+        hooks = ag_dir / "hooks.json"
+        hooks.write_text(json.dumps({"other-hook": {"enabled": True}}))
+        cfg = Config(data_dir=str(tmp_path), antigravity_dir=str(ag_dir))
+
+        actions = install_antigravity_hooks(cfg)
+
+        assert any("Antigravity Kindex hooks" in a for a in actions)
+        data = json.loads(hooks.read_text())
+        assert "other-hook" in data
+        block = data["kindex"]
+        assert block["enabled"] is True
+        assert "PreInvocation" in block
+        assert "PreToolUse" in block
+        assert "Stop" in block
+        assert "agent-prime-hook" in str(block["PreInvocation"])
+        assert "prompt-check" in str(block["PreInvocation"])
+        assert "attention-hook" in str(block["PreToolUse"])
+        assert "agent-stop-hook" in str(block["Stop"])
+        assert "source ~/.profile" in str(block)
+
+    def test_uninstall_antigravity_hooks_preserves_other_hooks(self, tmp_path):
+        from kindex.setup import uninstall_antigravity_hooks
+
+        ag_dir = tmp_path / ".gemini" / "config"
+        ag_dir.mkdir(parents=True)
+        hooks = ag_dir / "hooks.json"
+        hooks.write_text(json.dumps({
+            "other-hook": {"enabled": True},
+            "kindex": {"enabled": True},
+        }))
+        cfg = Config(data_dir=str(tmp_path), antigravity_dir=str(ag_dir))
+
+        actions = uninstall_antigravity_hooks(cfg)
+
+        assert any("Removed" in a for a in actions)
+        data = json.loads(hooks.read_text())
+        assert "kindex" not in data
+        assert "other-hook" in data
+
+    def test_antigravity_setup_cli_dry_runs(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        mcp = run("setup-antigravity-mcp", "--dry-run", data_dir=d)
+        hooks = run("setup-antigravity-hooks", "--dry-run", data_dir=d)
+        assert mcp.returncode == 0
+        assert hooks.returncode == 0
+
+
+class TestSetupOpenCode:
+    def test_install_opencode_mcp_writes_settings(self, tmp_path):
+        from kindex.setup import install_opencode_mcp
+
+        opencode_dir = tmp_path / ".config" / "opencode"
+        opencode_dir.mkdir(parents=True)
+        settings = opencode_dir / "opencode.json"
+        settings.write_text(json.dumps({"theme": "tokyonight"}))
+
+        cfg = Config(data_dir=str(tmp_path), opencode_dir=str(opencode_dir))
+        actions = install_opencode_mcp(cfg)
+
+        assert any("OpenCode MCP" in a for a in actions)
+        data = json.loads(settings.read_text())
+        assert data["theme"] == "tokyonight"
+        assert data["mcp"]["kindex"] == {
+            "type": "local",
+            "command": ["kin-mcp"],
+            "enabled": True,
+        }
+
+    def test_install_opencode_mcp_idempotent(self, tmp_path):
+        from kindex.setup import install_opencode_mcp
+
+        opencode_dir = tmp_path / ".config" / "opencode"
+        cfg = Config(data_dir=str(tmp_path), opencode_dir=str(opencode_dir))
+
+        install_opencode_mcp(cfg)
+        actions2 = install_opencode_mcp(cfg)
+
+        assert any("already installed" in a for a in actions2)
+
+    def test_install_opencode_mcp_dry_run_does_not_write(self, tmp_path):
+        from kindex.setup import install_opencode_mcp
+
+        opencode_dir = tmp_path / ".config" / "opencode"
+        cfg = Config(data_dir=str(tmp_path), opencode_dir=str(opencode_dir))
+        actions = install_opencode_mcp(cfg, dry_run=True)
+        assert any("Would add" in a for a in actions)
+        assert not (opencode_dir / "opencode.json").exists()
+
+    def test_uninstall_opencode_mcp_preserves_other_servers(self, tmp_path):
+        from kindex.setup import uninstall_opencode_mcp
+
+        opencode_dir = tmp_path / ".config" / "opencode"
+        opencode_dir.mkdir(parents=True)
+        settings = opencode_dir / "opencode.json"
+        settings.write_text(json.dumps({
+            "theme": "tokyonight",
+            "mcp": {
+                "kindex": {"type": "local", "command": ["kin-mcp"], "enabled": True},
+                "other": {"type": "local", "command": ["other"], "enabled": True},
+            },
+        }))
+
+        cfg = Config(data_dir=str(tmp_path), opencode_dir=str(opencode_dir))
+        actions = uninstall_opencode_mcp(cfg)
+
+        assert any("Removed" in a for a in actions)
+        data = json.loads(settings.read_text())
+        assert "kindex" not in data["mcp"]
+        assert "other" in data["mcp"]
+
+    def test_setup_opencode_mcp_cli_dry_run(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        r = run("setup-opencode-mcp", "--dry-run", data_dir=d)
+        assert r.returncode == 0
+
+
+class TestSetupCursor:
+    def test_install_cursor_mcp_writes_settings(self, tmp_path):
+        from kindex.setup import install_cursor_mcp
+
+        cursor_dir = tmp_path / ".cursor"
+        cursor_dir.mkdir()
+
+        cfg = Config(data_dir=str(tmp_path), cursor_dir=str(cursor_dir))
+        actions = install_cursor_mcp(cfg)
+
+        assert any("Cursor MCP" in a for a in actions)
+        data = json.loads((cursor_dir / "mcp.json").read_text())
+        assert data["mcpServers"]["kindex"] == {"type": "stdio", "command": "kin-mcp"}
+
+    def test_install_cursor_mcp_idempotent(self, tmp_path):
+        from kindex.setup import install_cursor_mcp
+
+        cursor_dir = tmp_path / ".cursor"
+        cfg = Config(data_dir=str(tmp_path), cursor_dir=str(cursor_dir))
+
+        install_cursor_mcp(cfg)
+        actions2 = install_cursor_mcp(cfg)
+
+        assert any("already installed" in a for a in actions2)
+
+    def test_install_cursor_mcp_dry_run_does_not_write(self, tmp_path):
+        from kindex.setup import install_cursor_mcp
+
+        cursor_dir = tmp_path / ".cursor"
+        cfg = Config(data_dir=str(tmp_path), cursor_dir=str(cursor_dir))
+        actions = install_cursor_mcp(cfg, dry_run=True)
+        assert any("Would add" in a for a in actions)
+        assert not (cursor_dir / "mcp.json").exists()
+
+    def test_uninstall_cursor_mcp_preserves_other_servers(self, tmp_path):
+        from kindex.setup import uninstall_cursor_mcp
+
+        cursor_dir = tmp_path / ".cursor"
+        cursor_dir.mkdir()
+        settings = cursor_dir / "mcp.json"
+        settings.write_text(json.dumps({
+            "mcpServers": {
+                "kindex": {"type": "stdio", "command": "kin-mcp"},
+                "other": {"type": "stdio", "command": "other"},
+            },
+        }))
+
+        cfg = Config(data_dir=str(tmp_path), cursor_dir=str(cursor_dir))
+        actions = uninstall_cursor_mcp(cfg)
+
+        assert any("Removed" in a for a in actions)
+        data = json.loads(settings.read_text())
+        assert "kindex" not in data["mcpServers"]
+        assert "other" in data["mcpServers"]
+
+    def test_setup_cursor_mcp_cli_dry_run(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        r = run("setup-cursor-mcp", "--dry-run", data_dir=d)
+        assert r.returncode == 0
+
+    def test_setup_cursor_rules_prints_block(self, tmp_path):
+        d = str(tmp_path)
+        run("init", data_dir=d)
+        r = run("setup-cursor-rules", data_dir=d)
+        assert r.returncode == 0
+        assert "alwaysApply: true" in r.stdout
+        assert "Kindex" in r.stdout
 
 
 class TestSetupCron:

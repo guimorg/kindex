@@ -30,8 +30,29 @@ def _dumps(obj, **kw):
 
 def _config(args):
     from .config import load_config
-    cfg = load_config(getattr(args, "config", None))
+    try:
+        cfg = load_config(
+            getattr(args, "config", None),
+            project_path=getattr(args, "project_path", None),
+            profile=getattr(args, "profile", None),
+        )
+    except ValueError as e:
+        # Unknown profile (or otherwise invalid config) — fail clearly
+        # instead of dumping a traceback or falling through to legacy.
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
     if getattr(args, "data_dir", None):
+        if cfg.active_profile:
+            # Explicit --data-dir overriding a profile-resolved data_dir:
+            # never stamp an unstamped database with the active profile
+            # (an existing mismatched stamp still hard-refuses in Store).
+            try:
+                same = (Path(args.data_dir).expanduser().resolve()
+                        == Path(cfg.data_dir).expanduser().resolve())
+            except (OSError, ValueError):
+                same = False
+            if not same:
+                cfg._stamp_on_open = False
         cfg.data_dir = args.data_dir
     return cfg
 
@@ -39,6 +60,12 @@ def _config(args):
 def _store(args):
     from .store import Store
     return Store(_config(args))
+
+
+def _hook_store(args, cfg=None):
+    """Open the graph with a short SQLite busy timeout for hook hot paths."""
+    from .store import Store
+    return Store(cfg or _config(args), sqlite_timeout=0.25)
 
 
 def _ledger(args):
@@ -180,6 +207,10 @@ def cmd_add(args):
             extra["expires"] = args.expires
         if args.resets:
             extra["resets"] = args.resets
+        if getattr(args, "attention_trigger", None):
+            extra["attention_triggers"] = [
+                t.strip() for t in args.attention_trigger.split(",") if t.strip()
+            ]
 
         nid = store.add_node(
             title=content,
@@ -577,9 +608,16 @@ def cmd_status(args):
     # Standard graph stats
     stats = store.stats()
 
+    cfg = _config(args)
     if args.json:
+        stats["profile"] = cfg.active_profile
+        stats["profile_source"] = cfg.profile_source if cfg.active_profile else None
         print(_dumps(stats, indent=2))
     else:
+        if cfg.active_profile:
+            print(f"Profile: {cfg.active_profile} (via {cfg.profile_source})")
+        else:
+            print("Profile: (none — legacy single-graph)")
         print(f"Nodes:     {stats['nodes']}")
         print(f"Edges:     {stats['edges']}")
         print(f"Orphans:   {stats['orphans']}")
@@ -601,7 +639,8 @@ def cmd_status(args):
 
 def cmd_budget(args):
     ledger, _ = _ledger(args)
-    s = ledger.summary()
+    conversation_id = getattr(args, "conversation_id", None)
+    s = ledger.summary(conversation_id=conversation_id)
 
     if args.json:
         print(_dumps(s, indent=2))
@@ -616,6 +655,12 @@ def cmd_budget(args):
             print(f"  {period:6s} {bar} ${d['spent']:.4f} / ${d['limit']:.2f}")
         status = "OK" if s["can_spend"] else "LIMIT REACHED"
         print(f"\n  Status: {status}")
+        if "conversation" in s:
+            c = s["conversation"]
+            print(
+                f"  Conversation {c['id']}: "
+                f"${c['spent']:.4f} total, ${c['spent_today']:.4f} today"
+            )
 
 
 # ── init / migrate / doctor ────────────────────────────────────────────
@@ -978,6 +1023,95 @@ def cmd_set_state(args):
     store.close()
 
 
+# ── edit / supersede ──────────────────────────────────────────────────
+
+_EDIT_FIELD_FLAGS = ("--title, --content, --append, --add-tags, "
+                     "--remove-tags, --intent, --expires")
+
+
+def cmd_edit(args):
+    """Policy-aware in-place edit of a node (ID or title resolution)."""
+    from .config import resolve_agent_id
+    from .store import EditPolicyError, LockHeldError
+
+    add_tags = [t.strip() for t in (getattr(args, "add_tags", None) or "").split(",")
+                if t.strip()] or None
+    remove_tags = [t.strip() for t in (getattr(args, "remove_tags", None) or "").split(",")
+                   if t.strip()] or None
+    fields = {
+        "title": getattr(args, "title", None),
+        "content": getattr(args, "content", None),
+        "append": getattr(args, "append", None),
+        "add_tags": add_tags,
+        "remove_tags": remove_tags,
+        "intent": getattr(args, "intent", None),
+        "expires": getattr(args, "expires", None),
+    }
+    provided = {k: v for k, v in fields.items() if v is not None}
+    if not provided:
+        print(f"Error: kin edit requires at least one field ({_EDIT_FIELD_FLAGS}).",
+              file=sys.stderr)
+        sys.exit(2)
+
+    cfg = _config(args)
+    store = _store(args)
+    ref = args.node_id
+    node = store.get_node(ref) or store.get_node_by_title(ref)
+    if not node:
+        print(f"Error: '{ref}' not found.", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+
+    try:
+        updated = store.edit_node(
+            node["id"],
+            actor=resolve_agent_id(cfg),
+            force=getattr(args, "force", False),
+            policy_overrides=cfg.edit_policy or None,
+            **provided,
+        )
+    except (EditPolicyError, LockHeldError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+
+    print(f"Edited {updated.get('title', '')} ({updated['id']}) — "
+          f"fields: {', '.join(sorted(provided))}")
+    store.close()
+
+
+def cmd_supersede(args):
+    """Replace a node with a fresh one, preserving history (ID or title)."""
+    from .config import resolve_agent_id
+    from .store import LockHeldError
+
+    cfg = _config(args)
+    store = _store(args)
+    ref = args.node_id
+    node = store.get_node(ref) or store.get_node_by_title(ref)
+    if not node:
+        print(f"Error: '{ref}' not found.", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+
+    text = " ".join(args.text)
+    try:
+        new = store.supersede_node(
+            node["id"], text,
+            actor=resolve_agent_id(cfg),
+            expires=getattr(args, "expires", None),
+            reason=getattr(args, "reason", None),
+            policy_overrides=cfg.edit_policy or None,
+        )
+    except (LockHeldError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+
+    print(f"Superseded {node['title']} ({node['id']}) -> {new['id']}")
+    store.close()
+
+
 # ── export ────────────────────────────────────────────────────────────
 
 def _strip_pii(node: dict) -> dict:
@@ -1011,7 +1145,38 @@ def cmd_export(args):
     --audience private: exports everything (for personal backup)
     """
     store = _store(args)
+    if getattr(args, "export_kind", "graph") == "code-map":
+        from .code_map import export_understand_anything
+
+        output_format = getattr(args, "format", "understand-anything")
+        if output_format not in ("understand-anything", "json"):
+            print("Error: code-map export supports --format understand-anything or json",
+                  file=sys.stderr)
+            sys.exit(1)
+        graph = export_understand_anything(
+            store,
+            directory=getattr(args, "directory", None),
+            project_name=getattr(args, "project_name", None),
+            limit=getattr(args, "limit", 10000),
+        )
+        output = _dumps(graph, indent=2)
+        output_path = getattr(args, "output", None)
+        if output_path:
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(output + "\n")
+            print(f"Wrote {path}", file=sys.stderr)
+        else:
+            print(output)
+        store.close()
+        return
+
     target_audience = args.audience
+
+    if args.format == "understand-anything":
+        print("Error: --format understand-anything requires `kin export code-map`",
+              file=sys.stderr)
+        sys.exit(1)
 
     if target_audience == "private":
         nodes = store.all_nodes(limit=10000)
@@ -1082,13 +1247,13 @@ def cmd_ingest(args):
 
     config = IngestConfig(
         since=getattr(args, "since", None),
-        limit=getattr(args, "limit", 50) or 50,
+        limit=getattr(args, "limit", None),
         verbose=True,
     )
 
     # Collect adapter-specific kwargs
     extra = {}
-    for key in ("repo", "repo_path", "team", "directory"):
+    for key in ("repo", "repo_path", "team", "directory", "unity"):
         val = getattr(args, key, None)
         if val is not None:
             extra[key] = val
@@ -1233,11 +1398,16 @@ def cmd_decay(args):
         node_half_life_days=args.node_half_life,
         edge_half_life_days=args.edge_half_life,
     )
+    cfg = _config(args)
+    pruned = store.decay_pheromone(
+        half_life_days=cfg.attention.pheromone_half_life_days,
+    )
 
     if args.json:
-        print(_dumps({"decayed_nodes": count}))
+        print(_dumps({"decayed_nodes": count, "pheromone_trails_pruned": pruned}))
     else:
-        print(f"Weight decay applied: {count} node(s) adjusted.")
+        print(f"Weight decay applied: {count} node(s) adjusted; "
+              f"{pruned} dead pheromone trail(s) pruned.")
 
     store.close()
 
@@ -1262,7 +1432,40 @@ def cmd_compact_hook(args):
             store.close()
             return
 
-    if not text or len(text.strip()) < 10:
+    # A Claude Code hook pipes a JSON envelope ({session_id,
+    # transcript_path, ...}) on stdin — metadata, not conversation text.
+    env = {}
+    try:
+        from .attention import parse_hook_payload
+        env = parse_hook_payload(text) if text else {}
+    except Exception:
+        env = {}
+    tpath = env.get("transcript_path") or env.get("transcriptPath") or ""
+    is_envelope = bool(env.get("hook_event_name") or env.get("session_id") or tpath)
+
+    # Silent, lightweight: if a hook envelope (PreCompact/Stop) gave us a
+    # transcript path, queue the session for later reinforcement grading in cron.
+    try:
+        from .attention import resolve_conversation_id
+        from .reinforce import enqueue_reinforce
+        if tpath or env.get("session_id"):
+            enqueue_reinforce(store, resolve_conversation_id(None, env),
+                              transcript_path=tpath)
+    except Exception:
+        pass
+
+    if is_envelope:
+        # Extracting from the envelope itself would mint one junk node per
+        # JSON field (issue #14). Substitute the real conversation text
+        # from the transcript file the envelope points at.
+        from .ingest import _extract_session_text
+        text = _extract_session_text(Path(tpath)) if tpath else ""
+
+    # Envelope-derived transcripts get a higher floor (real conversations
+    # are long; short residue means extraction failed). Plain piped text
+    # keeps the original threshold so short direct captures still work.
+    min_len = 50 if is_envelope else 10
+    if not text or len(text.strip()) < min_len:
         store.close()
         return
 
@@ -1273,6 +1476,10 @@ def cmd_compact_hook(args):
 
     count = 0
     for concept in extraction.get("concepts", []):
+        # Keyword fallback emits title-only concepts (useful for linking,
+        # not worth minting) — never create content-empty nodes here.
+        if not (concept.get("content") or "").strip():
+            continue
         if not store.get_node_by_title(concept["title"]):
             store.add_node(
                 title=concept["title"],
@@ -1311,23 +1518,92 @@ def cmd_prime(args):
     kin prime [--topic TOPIC] [--tokens N] [--for hook|stdout] [--codebook]
     """
     store = _store(args)
+    cfg = _config(args)
 
     if getattr(args, "codebook", False):
         _prime_codebook(store, args)
         store.close()
         return
 
+    from .agent_adapters import normalize_adapter, scope_adapter
+    from .agent_settings import (
+        agent_setting_value,
+        apply_agent_overrides,
+        resolve_agent_instance_key,
+    )
+    from .attention import parse_hook_payload, resolve_conversation_id
     from .hooks import prime_context
 
     topic = getattr(args, "topic", None)
     tokens = getattr(args, "tokens", 750) or 750
     output_for = getattr(args, "output_for", "stdout") or "stdout"
+    conversation_id = getattr(args, "conversation_id", None)
+    adapter = normalize_adapter(getattr(args, "adapter", "claude"))
+    hook_payload = {}
+    if output_for == "hook" and not conversation_id and not sys.stdin.isatty():
+        hook_payload = parse_hook_payload(sys.stdin.read())
+        conversation_id = resolve_conversation_id(
+            None,
+            hook_payload,
+            fallback_to_cwd=False,
+        )
+    instance_key = ""
+    if output_for == "hook" or getattr(args, "agent_instance", None):
+        instance_key = resolve_agent_instance_key(
+            adapter,
+            getattr(args, "agent_instance", None),
+            hook_payload,
+        )
+        tokens = int(agent_setting_value(
+            cfg,
+            client=adapter,
+            instance_key=instance_key,
+            key="hooks.prime_tokens",
+            default=tokens,
+        ) or tokens)
+        cfg = apply_agent_overrides(cfg, client=adapter, instance_key=instance_key)
 
-    block = prime_context(store, topic=topic, max_tokens=tokens)
+    block = prime_context(
+        store,
+        topic=topic,
+        max_tokens=tokens,
+        config=cfg,
+        conversation_id=conversation_id,
+        adapter=scope_adapter(adapter),
+    )
 
     if output_for == "hook":
-        # Just the context block, no header
-        print(block, end="")
+        # A new session clears any operator guidance (session-scoped) and says so once.
+        notice = ""
+        try:
+            from .sim import clear_sim_guidance
+            if clear_sim_guidance(store):
+                notice = "sim guidance cleared\n"
+        except Exception:
+            pass
+        body = notice + block
+        quiet = str(getattr(cfg.attention, "display", "full")).lower() == "quiet"
+        if adapter in {"codex", "antigravity"}:
+            # JSON adapters ingest context through client hook envelopes, so
+            # always render the adapter-specific envelope.
+            rendered = _hook_context_output(
+                body,
+                adapter=adapter,
+                event=("PreInvocation" if adapter == "antigravity" else "SessionStart"),
+                suppress=quiet,
+            )
+            if rendered:
+                print(rendered, end="")
+        elif quiet:
+            # Quiet mode: feed the context to the model but ask the client not to
+            # render the SessionStart block. Needs the JSON adapter for suppressOutput.
+            rendered = _hook_context_output(
+                body, adapter="claude", event="SessionStart", suppress=True,
+            )
+            if rendered:
+                print(rendered, end="")
+        else:
+            print(body, end="")
     else:
         # Add a header for human-readable output
         print("# Kindex Prime Context")
@@ -1337,6 +1613,100 @@ def cmd_prime(args):
         print(block)
 
     store.close()
+
+
+def cmd_agent_prime_hook(args):
+    """Prime-once hook for clients that do not have a SessionStart event."""
+    from .agent_adapters import normalize_adapter, scope_adapter
+    from .agent_settings import (
+        agent_setting_value,
+        apply_agent_overrides,
+        resolve_agent_instance_key,
+    )
+    from .attention import read_hook_payload, resolve_conversation_id
+    from .hooks import prime_context
+
+    adapter = normalize_adapter(getattr(args, "adapter", "plain"))
+    client = normalize_adapter(getattr(args, "client", None) or adapter)
+    payload = read_hook_payload()
+    conversation_id = resolve_conversation_id(
+        getattr(args, "conversation_id", None),
+        payload,
+        fallback_to_cwd=False,
+    )
+    instance_key = resolve_agent_instance_key(
+        client,
+        getattr(args, "agent_instance", None),
+        payload,
+    )
+
+    store = _store(args)
+    cfg = _config(args)
+    if not conversation_id:
+        store.close()
+        return
+
+    meta_key = f"agent_prime_hook.{client}.{conversation_id}"
+    if store.get_meta(meta_key):
+        store.close()
+        return
+
+    tokens = int(agent_setting_value(
+        cfg,
+        client=client,
+        instance_key=instance_key,
+        key="hooks.prime_tokens",
+        default=getattr(args, "tokens", 750) or 750,
+    ) or 750)
+    cfg = apply_agent_overrides(cfg, client=client, instance_key=instance_key)
+    block = prime_context(
+        store,
+        topic=getattr(args, "topic", None),
+        max_tokens=tokens,
+        config=cfg,
+        conversation_id=conversation_id,
+        adapter=scope_adapter(client),
+    )
+    store.set_meta(meta_key, datetime.datetime.now().isoformat(timespec="seconds"))
+    rendered = _hook_context_output(
+        block,
+        adapter=adapter,
+        event=getattr(args, "event", None) or "PreInvocation",
+        suppress=str(getattr(cfg.attention, "display", "full")).lower() == "quiet",
+    )
+    if rendered:
+        print(rendered, end="")
+    store.close()
+
+
+def cmd_agent_stop_hook(args):
+    """Portable session-end hook: enqueue reinforcement and satisfy client schema."""
+    from .agent_adapters import normalize_adapter
+    from .attention import read_hook_payload, resolve_conversation_id
+
+    adapter = normalize_adapter(getattr(args, "adapter", "plain"))
+    payload = read_hook_payload()
+    store = _store(args)
+    conversation_id = resolve_conversation_id(
+        getattr(args, "conversation_id", None),
+        payload,
+        fallback_to_cwd=False,
+    )
+    if conversation_id:
+        try:
+            from .reinforce import enqueue_reinforce
+            transcript_path = (
+                payload.get("transcript_path")
+                or payload.get("transcriptPath")
+                or payload.get("conversationPath")
+                or ""
+            )
+            enqueue_reinforce(store, conversation_id, transcript_path=transcript_path)
+        except Exception:
+            pass
+    store.close()
+    if adapter == "antigravity":
+        print(_dumps({"decision": ""}))
 
 
 def _prime_codebook(store, args):
@@ -1493,6 +1863,15 @@ def cmd_log(args):
 
 # ── changelog ─────────────────────────────────────────────────────────
 
+def _diff_value(value, limit: int = 60) -> str:
+    """Compact a diff old/new value for one-line changelog rendering."""
+    if value is None or value == "":
+        return "(none)"
+    s = value if isinstance(value, str) else _dumps(value)
+    s = " ".join(s.split())  # collapse newlines/whitespace
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
 def cmd_changelog(args):
     """Show what changed in the graph since a date or over the last N days."""
     store = _store(args)
@@ -1531,6 +1910,8 @@ def cmd_changelog(args):
         "update_node": "Updated",
         "delete_node": "Deleted",
         "add_edge": "Linked",
+        "edit_node": "Edited",
+        "supersede_node": "Superseded",
     }
     groups: dict[str, list[dict]] = {}
     for e in entries:
@@ -1588,6 +1969,15 @@ def cmd_changelog(args):
                     ntype = details.get("type", "")
                     type_str = f"[{ntype}] " if ntype else ""
                     print(f"  {ts}  {type_str}{target_title}")
+
+                # Compact per-field diff lines for edits
+                diffs = details.get("diffs") if isinstance(details, dict) else None
+                if isinstance(diffs, dict):
+                    for field, change in diffs.items():
+                        if not isinstance(change, dict):
+                            continue
+                        print(f"      {field}: {_diff_value(change.get('old'))} "
+                              f"-> {_diff_value(change.get('new'))}")
             print()
 
     store.close()
@@ -1750,11 +2140,55 @@ def cmd_index(args):
     from .ingest import write_kin_index
 
     output_dir = Path(getattr(args, "output_dir", None) or os.getcwd())
-    path = write_kin_index(store, output_dir)
+    try:
+        path = write_kin_index(store, output_dir)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        store.close()
+        sys.exit(1)
     print(f"Wrote {path}")
     print(f"  ({path.stat().st_size} bytes)")
 
+    # Default: register the structured merge driver so this freshly written,
+    # git-tracked artifact is conflict-safe from the start. Guarded + idempotent
+    # (only when inside a git repo and not already registered in this clone).
+    # Best-effort: a merge-driver hiccup must never fail the index write itself.
+    if not getattr(args, "no_merge_driver", False):
+        try:
+            from .setup import (
+                git_repo_root, install_merge_driver, merge_driver_registered,
+            )
+            root = git_repo_root(output_dir)
+            if root is not None and not merge_driver_registered(root):
+                for a in install_merge_driver(root):
+                    print(f"  merge-driver: {a}")
+                print("  (registered .kin structured merge; opt out with --no-merge-driver)")
+        except Exception as e:
+            print(f"  merge-driver: skipped ({e})", file=sys.stderr)
+
     store.close()
+
+
+def cmd_merge_kin(args):
+    """Git merge driver for .kin artifacts — structured union, no manual conflicts.
+
+    Invoked by git as ``kin merge-kin %O %A %B %P``. Writes the merged result to
+    the ours/%A file and exits 0 when resolved; exits 1 (declining) for an
+    unrecognized file or invalid JSON, leaving the conflict for git to record
+    so it can be resolved manually.
+    """
+    from .kin_merge import merge_kin_files
+
+    merged = merge_kin_files(
+        getattr(args, "path", "") or "",
+        getattr(args, "base", "") or "",
+        getattr(args, "ours", "") or "",
+        getattr(args, "theirs", "") or "",
+    )
+    if merged is None:
+        sys.exit(1)
+    Path(args.ours).write_text(merged)
+    print(f"merge-kin: resolved {args.path}", file=sys.stderr)
 
 
 # ── sync-links ────────────────────────────────────────────────────────
@@ -1867,23 +2301,267 @@ def cmd_alias(args):
 
 def cmd_whoami(args):
     """Show the current user identity used for --mine filtering."""
+    from .config import resolve_agent_id
     cfg = _config(args)
+    if getattr(args, "json", False):
+        print(_dumps({"user": cfg.current_user, "agent": resolve_agent_id(cfg)}))
+        return
     print(cfg.current_user)
+    print(f"Agent: {resolve_agent_id(cfg)}")
+
+
+# ── profile ───────────────────────────────────────────────────────────
+
+def cmd_profile(args):
+    """Manage named graph profiles (sequestered multi-profile storage).
+
+    kin profile list              — configured profiles + file-level stats
+    kin profile which             — resolved profile for this invocation
+    kin profile create <name> --data-dir DIR [--roots a,b] [--default]
+    """
+    action = getattr(args, "profile_action", "list")
+
+    if action == "create":
+        _profile_create(args)
+        return
+
+    cfg = _config(args)
+
+    if action == "which":
+        if args.json:
+            print(_dumps({
+                "profile": cfg.active_profile,
+                "source": cfg.profile_source if cfg.active_profile else None,
+            }))
+        elif cfg.active_profile:
+            print(f"{cfg.active_profile} (via {cfg.profile_source})")
+        else:
+            print("(none — legacy single-graph)")
+        return
+
+    # list (default) — file-level stats only; no cross-profile graph reads.
+    if not cfg.profiles:
+        if args.json:
+            print(_dumps({"profiles": {}, "default_profile": None}))
+        else:
+            print("No profiles configured (legacy single-graph).")
+            print("Create one: kin profile create <name> --data-dir <dir> [--roots <dirs>]")
+        return
+
+    if args.json:
+        print(_dumps({
+            "profiles": {n: e.model_dump() for n, e in cfg.profiles.items()},
+            "default_profile": cfg.default_profile,
+            "active_profile": cfg.active_profile,
+        }, indent=2))
+        return
+
+    for name, entry in cfg.profiles.items():
+        markers = []
+        if name == cfg.default_profile:
+            markers.append("default")
+        if name == cfg.active_profile:
+            markers.append("active")
+        suffix = f" ({', '.join(markers)})" if markers else ""
+        print(f"{name}{suffix}")
+        data_path = Path(entry.data_dir).expanduser()
+        db = data_path / "kindex.db"
+        if not db.exists() and (data_path / "conv.db").exists():
+            db = data_path / "conv.db"
+        if db.exists():
+            print(f"  data_dir: {entry.data_dir} ({db.name}, {db.stat().st_size} bytes)")
+        else:
+            print(f"  data_dir: {entry.data_dir} (no database yet)")
+        if entry.roots:
+            print(f"  roots:    {', '.join(entry.roots)}")
+
+
+def _profile_create(args):
+    """Create a profile in the GLOBAL kin.yaml (or an explicit --config file),
+    preserving existing content."""
+    name = getattr(args, "name", None)
+    if not name:
+        print("Error: kin profile create <name> --data-dir <dir>", file=sys.stderr)
+        sys.exit(2)
+    profile_data_dir = getattr(args, "data_dir", None)
+    if not profile_data_dir:
+        print("Error: --data-dir is required for profile create", file=sys.stderr)
+        sys.exit(2)
+
+    from .config import _GLOBAL_PATHS
+
+    # An explicit --config is the write target (mirrors `kin config set`);
+    # otherwise fall through to the global kin.yaml discovery.
+    explicit = getattr(args, "config", None)
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        path = None
+        for p in _GLOBAL_PATHS:
+            p = p.expanduser().resolve()
+            if p.is_file():
+                path = p
+                break
+        if path is None:
+            path = (Path.home() / ".config" / "kindex" / "kin.yaml").resolve()
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Round-trip the existing yaml: load, modify, dump — unknown keys survive.
+    data = (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+    profiles = data.get("profiles") or {}
+    if name in profiles:
+        print(f"Error: profile '{name}' already exists in {path}", file=sys.stderr)
+        sys.exit(1)
+
+    roots = [r.strip() for r in (getattr(args, "roots", None) or "").split(",")
+             if r.strip()]
+    profiles[name] = {"data_dir": profile_data_dir, "roots": roots}
+    data["profiles"] = profiles
+    if getattr(args, "set_default", False):
+        data["default_profile"] = name
+    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+
+    print(f"Created profile '{name}' in {path}")
+    print(f"  data_dir: {profile_data_dir}")
+    if roots:
+        print(f"  roots:    {', '.join(roots)}")
+    if getattr(args, "set_default", False):
+        print(f"  default_profile: {name}")
+
+    # Warn when the legacy graph would be orphaned or shadowed: an existing
+    # graph at the base data_dir that no profile registers stops receiving
+    # routed sessions once a default profile exists.
+    default_name = data.get("default_profile")
+    base_dir = Path(str(data.get("data_dir") or "~/.kindex")).expanduser()
+    try:
+        base_res = base_dir.resolve()
+    except OSError:
+        base_res = base_dir
+    registered = set()
+    for entry in profiles.values():
+        if isinstance(entry, dict) and entry.get("data_dir"):
+            try:
+                registered.add(Path(str(entry["data_dir"])).expanduser().resolve())
+            except OSError:
+                registered.add(Path(str(entry["data_dir"])).expanduser())
+    legacy_db_exists = ((base_dir / "kindex.db").exists()
+                        or (base_dir / "conv.db").exists())
+    if base_res not in registered:
+        if default_name and legacy_db_exists:
+            print(f"Warning: the existing legacy graph at {base_dir} is not "
+                  f"registered as a profile. With default_profile "
+                  f"'{default_name}', sessions outside all profile roots are "
+                  f"routed to '{default_name}' and the legacy graph no longer "
+                  f"receives cron maintenance.", file=sys.stderr)
+            print(f"  Register it first, e.g.: kin profile create personal "
+                  f"--data-dir {base_dir} --roots <dirs> --default",
+                  file=sys.stderr)
+        elif not default_name:
+            print(f"Note: no default_profile set — sessions outside all "
+                  f"profile roots stay in the legacy graph at {base_dir} "
+                  f"(cron services it in a legacy-remainder pass). Use "
+                  f"--default on one profile to change that.", file=sys.stderr)
 
 
 # ── embed ─────────────────────────────────────────────────────────────
 
 def cmd_embed(args):
-    """Index all nodes for vector similarity search.
+    """Index or reindex nodes for vector similarity search.
 
     Requires: pip install kindex[vectors]
     """
     store = _store(args)
+    action = getattr(args, "embed_action", None) or "index"
+
+    def _split_csv(value):
+        if not value:
+            return None
+        return [v.strip() for v in value.split(",") if v.strip()]
+
+    def _filters():
+        return {
+            "tags": _split_csv(getattr(args, "tags", None)),
+            "node_type": getattr(args, "node_type", None),
+            "status": getattr(args, "status", None),
+            "since": getattr(args, "since", None),
+            "project_path": (getattr(args, "kin", None)
+                             or getattr(args, "target", None)),
+            "stale": getattr(args, "stale", False),
+            "limit": getattr(args, "limit", None),
+        }
 
     try:
-        from .vectors import index_all_nodes
-        count = index_all_nodes(store, verbose=getattr(args, "verbose", False))
-        print(f"Embedded {count} nodes for vector search.")
+        from .vectors import (
+            drain_embedding_queue,
+            embedding_status,
+            enqueue_reindex,
+            index_all_nodes,
+            plan_embedding_reindex,
+            reindex_now,
+        )
+        if action == "status":
+            result = embedding_status(store)
+        elif action == "plan":
+            result = plan_embedding_reindex(store, **_filters())
+        elif action == "enqueue":
+            filters = _filters()
+            filters["max_queue"] = getattr(args, "max_queue", None)
+            result = enqueue_reindex(store, **filters)
+        elif action == "drain":
+            budget = getattr(args, "time_budget", None)
+            if budget == 0:
+                budget = float("inf")  # explicit 0 = drain the whole backlog
+            result = drain_embedding_queue(
+                store, store.config,
+                max_jobs=getattr(args, "max_jobs", None),
+                time_budget=budget,
+            )
+        elif action == "reindex":
+            if getattr(args, "enqueue", False):
+                filters = _filters()
+                filters["max_queue"] = getattr(args, "max_queue", None)
+                result = enqueue_reindex(store, **filters)
+            else:
+                result = reindex_now(
+                    store, verbose=getattr(args, "verbose", False), **_filters()
+                )
+        else:
+            count = index_all_nodes(store, verbose=getattr(args, "verbose", False))
+            result = {"status": "ok", "embedded": count}
+        if args.json:
+            print(_dumps(result, indent=2))
+        elif action == "status":
+            print(f"Provider: {result['provider']} / {result['model']}")
+            print(f"Strategy: {result['strategy']} "
+                  f"(contextual_supported={result['contextual_supported']})")
+            print(f"Dimensions: {result['dimensions']}")
+            print(f"Indexed nodes: {result.get('indexed_nodes')}")
+            print(f"Vector rows: {result.get('vector_rows')}")
+            print(f"Queue pending: {result['queue_pending']}")
+        elif action == "plan":
+            print(f"Nodes: {result['nodes']}")
+            print(f"Chunks: {result['chunks']}")
+            print(f"Estimated tokens: {result['estimated_tokens']}")
+            if result.get("estimated_cost_usd") is not None:
+                print(f"Estimated cost: ${result['estimated_cost_usd']:.4f}")
+            else:
+                print("Estimated cost: unknown for this provider/model")
+        elif action == "enqueue":
+            print(f"Enqueued {result['enqueued']} nodes "
+                  f"({result['queue_pending']} pending).")
+        elif action == "drain":
+            print(f"Embedded {result.get('embedded', 0)} queued nodes "
+                  f"({result.get('pending', 0)} pending).")
+        elif action == "reindex":
+            if result.get("enqueued") is not None:
+                print(f"Enqueued {result['enqueued']} nodes "
+                      f"({result['queue_pending']} pending).")
+            else:
+                print(f"Embedded {result.get('embedded', 0)} nodes "
+                      f"({result.get('failed', 0)} failed).")
+        else:
+            print(f"Embedded {result['embedded']} nodes for vector search.")
     except Exception as e:
         print(f"Vector indexing failed: {e}", file=sys.stderr)
         print("Install dependencies: pip install kindex[vectors]", file=sys.stderr)
@@ -2346,19 +3024,45 @@ def cmd_import_graph(args):
 # ── cron ──────────────────────────────────────────────────────────────
 
 def cmd_cron(args):
-    """Run one-shot maintenance cycle (designed for crontab)."""
-    store = _store(args)
+    """Run one-shot maintenance cycle (designed for crontab).
+
+    With profiles configured, runs one pass per profile (each on its own
+    data_dir), plus a legacy-remainder pass when no default_profile is set.
+    An explicit --data-dir or --profile pins a single pass; session routing
+    stays active whenever a profile resolves (the pinned pass only ingests
+    the sessions that profile owns). A bare --data-dir with no resolved
+    profile runs a legacy take-everything pass on exactly that directory.
+    """
     cfg = _config(args)
     verbose = getattr(args, "verbose", False)
 
-    from .daemon import cron_run
+    from .daemon import cron_run_all
 
-    results = cron_run(cfg, store, verbose=verbose)
+    if getattr(args, "data_dir", None) or getattr(args, "profile", None):
+        # Explicit targeting: single pass on exactly this data_dir/profile.
+        # Routing must survive the pin: build the session predicate from the
+        # FULL profiles dict before clearing it, so the pinned pass never
+        # ingests sessions owned by other profiles.
+        if cfg.profiles and cfg.active_profile:
+            from .routing import profile_session_filter
+            cfg._session_filter = profile_session_filter(
+                dict(cfg.profiles), cfg.active_profile, cfg.default_profile)
+        cfg.profiles = {}
+    passes = cron_run_all(cfg, verbose=verbose)
 
     if args.json:
-        print(_dumps(results, indent=2))
-    else:
-        print("Cron maintenance complete:")
+        if len(passes) == 1 and passes[0]["profile"] is None:
+            print(_dumps(passes[0]["results"], indent=2))  # legacy shape
+        else:
+            print(_dumps(passes, indent=2))
+        return
+
+    for p in passes:
+        results = p["results"]
+        if p["profile"]:
+            print(f"Cron maintenance complete (profile: {p['profile']}):")
+        else:
+            print("Cron maintenance complete:")
         print(f"  Projects scanned:  {results.get('projects', 0)}")
         print(f"  .kin/config updates: {results.get('kin_updates', 0)}")
         print(f"  Sessions ingested: {results.get('sessions', 0)}")
@@ -2391,8 +3095,6 @@ def cmd_cron(args):
             elif action == "disabled":
                 print(f"  Cron interval: disabled (no pending reminders)")
 
-    store.close()
-
 
 # ── dream ─────────────────────────────────────────────────────────────
 
@@ -2414,11 +3116,16 @@ def cmd_dream(args):
 
     if detach:
         from .dream import detach_dream
-        pid = detach_dream(cfg, mode=mode)
+        result = detach_dream(cfg, mode=mode, force=getattr(args, "force", False))
         if not args.json:
-            print(f"Dream detached (pid={pid}, mode={mode})")
+            if result.get("detached"):
+                print(f"Dream detached (pid={result['pid']}, mode={mode})")
+            else:
+                skipped = result.get("skipped", "not_due")
+                detail = f"; next allowed {result['next_allowed']}" if result.get("next_allowed") else ""
+                print(f"Dream detach skipped: {skipped}{detail}")
         else:
-            print(_dumps({"detached": True, "pid": pid, "mode": mode}))
+            print(_dumps(result))
         store.close()
         return
 
@@ -2623,6 +3330,59 @@ def cmd_task(args):
         else:
             print(f"Task not found: {task_id}", file=sys.stderr)
 
+    elif action == "claim":
+        from .config import resolve_agent_id
+        from .tasks import claim_task
+        task_id = getattr(args, "task_id", None)
+        agent = getattr(args, "agent", None) or resolve_agent_id(_config(args))
+        if not task_id:
+            print("Usage: kin task claim --task-id <id> [--agent <name>]", file=sys.stderr)
+            store.close()
+            return
+        try:
+            result = claim_task(
+                store,
+                task_id,
+                agent,
+                ttl_minutes=getattr(args, "ttl", 120) or 120,
+                note=getattr(args, "note", "") or "",
+                force=getattr(args, "force", False),
+            )
+            if result:
+                claim = (result.get("extra") or {}).get("claim") or {}
+                print(f"Claimed: {result['title']} by {claim.get('agent')}")
+            else:
+                print(f"Task not found: {task_id}", file=sys.stderr)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "release":
+        from .config import resolve_agent_id
+        from .tasks import release_task_claim
+        task_id = getattr(args, "task_id", None)
+        if not task_id:
+            print("Usage: kin task release --task-id <id> [--agent <name>]", file=sys.stderr)
+            store.close()
+            return
+        try:
+            result = release_task_claim(
+                store,
+                task_id,
+                agent=getattr(args, "agent", "") or resolve_agent_id(_config(args)),
+                force=getattr(args, "force", False),
+            )
+            if result:
+                print(f"Released claim: {result['title']}")
+            else:
+                print(f"Task not found: {task_id}", file=sys.stderr)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "cleanup":
+        from .tasks import cleanup_expired_claims
+        count = cleanup_expired_claims(store)
+        print(f"Cleaned expired claims: {count}")
+
     elif action == "done":
         from .tasks import complete_task
         task_id = getattr(args, "task_id", None)
@@ -2693,6 +3453,233 @@ def cmd_task(args):
             print(f"Tasks near: {topic}")
             print(format_task_list(tasks))
 
+    store.close()
+
+
+# ── coordination ──────────────────────────────────────────────────────
+
+
+def cmd_coord(args):
+    """Short-lived coordination conversations for agents."""
+    from .config import resolve_agent_id
+    cfg = _config(args)
+    store = _store(args)
+    action = getattr(args, "coord_action", "list")
+    agent = getattr(args, "agent", "") or resolve_agent_id(cfg)
+
+    if action == "start":
+        from .coordination import create_conversation
+        name = getattr(args, "name", None)
+        if not name:
+            print("Usage: kin coord start <name>", file=sys.stderr)
+            store.close()
+            return
+        try:
+            conv_id = create_conversation(
+                store,
+                name,
+                task_id=getattr(args, "task_id", None),
+                ttl_minutes=getattr(args, "ttl", 240) or 240,
+                project_path=os.getcwd(),
+                created_by=agent,
+            )
+            print(f"Started coordination conversation: {conv_id}")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "post":
+        from .coordination import post_message
+        ref = getattr(args, "name", None)
+        body = " ".join(getattr(args, "message_words", []) or [])
+        if not ref or not body:
+            print("Usage: kin coord post <name-or-id> <message> [--agent <name>] [--to <agent>]",
+                  file=sys.stderr)
+            store.close()
+            return
+        try:
+            msg = post_message(store, ref, agent, body,
+                               to=getattr(args, "to", None))
+            print(f"Posted message #{msg['id']}")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "read":
+        from .coordination import format_messages, read_messages
+        ref = getattr(args, "name", None)
+        if not ref:
+            print("Usage: kin coord read <name-or-id>", file=sys.stderr)
+            store.close()
+            return
+        try:
+            payload = read_messages(
+                store,
+                ref,
+                since_id=getattr(args, "since_id", 0) or 0,
+                limit=getattr(args, "limit", 50) or 50,
+                agent=agent,
+            )
+            print(_dumps(payload) if getattr(args, "json", False) else format_messages(payload))
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "join":
+        from .coordination import join_conversation
+        ref = getattr(args, "name", None)
+        if not ref:
+            print("Usage: kin coord join <name-or-id> [--agent <name>]", file=sys.stderr)
+            store.close()
+            return
+        try:
+            member = join_conversation(store, ref, agent)
+            print(f"Joined {ref} as {member['agent']}")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "attach":
+        from .coordination import attach_resource
+        ref = getattr(args, "name", None)
+        words = getattr(args, "message_words", []) or []
+        if not ref or not words:
+            print("Usage: kin coord attach <name-or-id> <node-id-or-title>", file=sys.stderr)
+            store.close()
+            return
+        target = " ".join(words)
+        node = store.get_node(target) or store.get_node_by_title(target)
+        try:
+            resources = attach_resource(store, ref, node["id"] if node else target)
+            print(f"Attached. Resources: {', '.join(resources)}")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "inject":
+        from .coordination import (
+            clear_inject_messages,
+            list_inject_messages,
+            set_inject_message,
+        )
+        ref = getattr(args, "name", None)
+        words = getattr(args, "message_words", []) or []
+        sub = words[0] if words else "list"
+        if not ref or sub not in ("set", "clear", "list"):
+            print("Usage: kin coord inject <name-or-id> set <text> [--to <agent>] | "
+                  "clear [--id N] | list", file=sys.stderr)
+            store.close()
+            return
+        try:
+            if sub == "set":
+                text = " ".join(words[1:])
+                entry = set_inject_message(store, ref, text, agent,
+                                           to=getattr(args, "to", None))
+                print(f"Set inject message #{entry['id']}"
+                      + (f" -> {entry['to']}" if entry.get("to") else ""))
+            elif sub == "clear":
+                count = clear_inject_messages(
+                    store, ref, message_id=getattr(args, "id", None))
+                print(f"Cleared {count} inject message(s)")
+            else:
+                msgs = list_inject_messages(store, ref)
+                if getattr(args, "json", False):
+                    print(_dumps(msgs))
+                elif not msgs:
+                    print("No inject messages.")
+                else:
+                    for m in msgs:
+                        target = f" -> {m['to']}" if m.get("to") else ""
+                        print(f"  #{m.get('id')} {m.get('created_at')} "
+                              f"{m.get('set_by')}{target}: {m.get('text')}")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+
+    elif action == "list":
+        from .coordination import format_conversations, list_conversations
+        conversations = list_conversations(
+            store,
+            status=getattr(args, "status", None) or "active",
+            project_path=os.getcwd() if getattr(args, "project", False) else None,
+            task_id=getattr(args, "task_id", None),
+        )
+        print(_dumps(conversations) if getattr(args, "json", False)
+              else format_conversations(conversations))
+
+    elif action == "end":
+        from .coordination import end_conversation
+        ref = getattr(args, "name", None)
+        if not ref:
+            print("Usage: kin coord end <name-or-id>", file=sys.stderr)
+            store.close()
+            return
+        result = end_conversation(store, ref, summary=getattr(args, "summary", "") or "")
+        if result:
+            print(f"Ended coordination conversation: {ref}")
+        else:
+            print(f"Conversation not found: {ref}", file=sys.stderr)
+
+    elif action == "cleanup":
+        from .coordination import cleanup_expired_conversations
+        count = cleanup_expired_conversations(store)
+        print(f"Cleaned expired conversations: {count}")
+
+    store.close()
+
+
+# ── locks ────────────────────────────────────────────────────────────
+
+
+def cmd_lock(args):
+    """Acquire an advisory lock on a node for the current agent."""
+    from .config import resolve_agent_id
+    from .locks import lock_node
+    from .store import LockHeldError
+    cfg = _config(args)
+    store = _store(args)
+    agent = getattr(args, "agent", "") or resolve_agent_id(cfg)
+    ref = args.node_id
+    node = store.get_node(ref) or store.get_node_by_title(ref)
+    if not node:
+        print(f"Error: '{ref}' not found.", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+    try:
+        lock = lock_node(
+            store, node["id"], agent,
+            ttl_minutes=getattr(args, "ttl", 60) or 60,
+            note=getattr(args, "note", "") or "",
+            force=getattr(args, "force", False),
+        )
+        print(f"Locked {node['title']} ({node['id']}) for {lock['agent']} "
+              f"until {lock['expires_at']}")
+    except (LockHeldError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+    store.close()
+
+
+def cmd_unlock(args):
+    """Release an advisory lock on a node."""
+    from .config import resolve_agent_id
+    from .locks import unlock_node
+    from .store import LockHeldError
+    cfg = _config(args)
+    store = _store(args)
+    agent = getattr(args, "agent", "") or resolve_agent_id(cfg)
+    ref = args.node_id
+    node = store.get_node(ref) or store.get_node_by_title(ref)
+    if not node:
+        print(f"Error: '{ref}' not found.", file=sys.stderr)
+        store.close()
+        sys.exit(1)
+    try:
+        cleared = unlock_node(store, node["id"], agent,
+                              force=getattr(args, "force", False))
+        if cleared:
+            print(f"Unlocked {node['title']} ({node['id']})")
+        else:
+            print(f"No lock on {node['title']} ({node['id']})")
+    except LockHeldError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        store.close()
+        sys.exit(1)
     store.close()
 
 
@@ -2813,6 +3800,17 @@ def cmd_remind(args):
                 action_command=getattr(args, "action_command", "") or "",
                 action_instructions=getattr(args, "action_instructions", "") or "",
                 action_mode=getattr(args, "action_mode", "auto") or "auto",
+                wake_client=getattr(args, "wake_client", "") or "",
+                wake_session_id=getattr(args, "wake_session_id", "") or "",
+                wake_cwd=getattr(args, "wake_cwd", "") or "",
+                wake_model=getattr(args, "wake_model", "") or "",
+                wake_agent=getattr(args, "wake_agent", "") or "",
+                attention_triggers=([
+                    t.strip() for t in getattr(args, "attention_trigger", "").split(",")
+                    if t.strip()
+                ] if getattr(args, "attention_trigger", None) else None),
+                conversation_id=getattr(args, "conversation_id", "") or "",
+                scope=getattr(args, "reminder_scope", "") or "",
             )
             r = store.get_reminder(rid)
             if getattr(args, "json", False):
@@ -2911,20 +3909,34 @@ def cmd_remind(args):
             print(f"Reminder {rid} has no action defined.", file=sys.stderr)
             store.close()
             return
-        result = execute_action(store, r, cfg)
+        result = execute_action(store, r, cfg, manual=True)
         if getattr(args, "json", False):
             print(_dumps(result))
         else:
             print(f"Action {result['status']}: {result.get('output', '')[:200]}")
 
     elif action == "check":
-        from .reminders import auto_snooze_stale, check_and_fire
-        fired = check_and_fire(store, cfg)
-        snoozed = auto_snooze_stale(store, cfg)
-        if getattr(args, "json", False):
-            print(_dumps({"fired": len(fired), "auto_snoozed": snoozed}))
+        if getattr(args, "all_profiles", False):
+            # Sweep every configured profile graph (plus the legacy remainder)
+            # — the shape the installed reminder scheduler runs, so no graph's
+            # reminders depend on which profile happens to resolve here.
+            from .daemon import remind_check_all
+            sweeps = remind_check_all(cfg)
+            if getattr(args, "json", False):
+                print(_dumps(sweeps))
+            else:
+                for s in sweeps:
+                    label = s["profile"] or "default"
+                    print(f"Checked [{label}]: {s['fired']} fired, "
+                          f"{s['auto_snoozed']} auto-snoozed")
         else:
-            print(f"Checked: {len(fired)} fired, {snoozed} auto-snoozed")
+            from .reminders import auto_snooze_stale, check_and_fire
+            fired = check_and_fire(store, cfg)
+            snoozed = auto_snooze_stale(store, cfg)
+            if getattr(args, "json", False):
+                print(_dumps({"fired": len(fired), "auto_snoozed": snoozed}))
+            else:
+                print(f"Checked: {len(fired)} fired, {snoozed} auto-snoozed")
 
     store.close()
 
@@ -2937,10 +3949,24 @@ def cmd_stop_guard(args):
     """
     import json as _json
 
+    if not sys.stdin.isatty():
+        raw = sys.stdin.read()
+        if raw.strip():
+            try:
+                payload = _json.loads(raw)
+            except _json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict) and payload.get("stop_hook_active"):
+                return
+
     store = _store(args)
     cfg = _config(args)
 
-    if not cfg.reminders.enabled or not cfg.reminders.action_enabled:
+    if (
+        not cfg.reminders.enabled
+        or not cfg.reminders.action_enabled
+        or not cfg.reminders.stop_guard_enabled
+    ):
         store.close()
         return
 
@@ -2988,6 +4014,109 @@ def cmd_stop_guard(args):
         print(_json.dumps(result))
 
 
+def _hook_context_output(context: str, *, adapter: str, event: str,
+                         suppress: bool = False) -> str:
+    """Render advisory context in the hook protocol for a client.
+
+    suppress=True sets `suppressOutput` so the context still feeds the model via
+    `additionalContext` but the client is asked NOT to render the block to the
+    user (the "feed me, don't show you" quiet mode). Only meaningful for the JSON
+    adapters; plain adapters echo the text and cannot hide it.
+    """
+    from .agent_adapters import render_hook_context
+
+    return render_hook_context(
+        context,
+        adapter=adapter,
+        event=event,
+        suppress=suppress,
+    )
+
+
+def _collab_unread_messages(store, collab: dict, agent: str) -> list[dict]:
+    """New messages in a collab for an agent: id > their read cursor,
+    targeted to them or broadcast. Does NOT advance the cursor (only an
+    explicit coord_read marks messages as read)."""
+    node = store.get_node(collab.get("node_id", ""))
+    if not node:
+        return []
+    extra = node.get("extra") or {}
+    cursor = 0
+    for member in extra.get("members") or []:
+        if isinstance(member, dict) and member.get("agent") == agent:
+            cursor = int(member.get("last_read_id", 0) or 0)
+            break
+    out = []
+    for m in extra.get("messages") or []:
+        if not isinstance(m, dict) or int(m.get("id", 0)) <= cursor:
+            continue
+        to = (m.get("to") or "").strip()
+        if to and to != agent:
+            continue
+        out.append(m)
+    return out
+
+
+def _collab_prompt_lines(store, cfg, conversation_id: str) -> list[str]:
+    """Collab updates for the UserPromptSubmit hook.
+
+    New targeted/broadcast messages since the agent's read cursor plus standing
+    inject messages, rate-limited per conversation via the store meta key
+    'collab.prompt_last_injected.<conversation_id>' and
+    config.collab.prompt_cooldown_minutes. Bodies are truncated to ~200 chars;
+    read cursors are NOT advanced (only coord_read does that).
+    """
+    from .config import resolve_agent_id
+    from .coordination import active_collabs_for_agent
+
+    if not cfg.collab.enabled:
+        return []
+
+    agent = resolve_agent_id(cfg)
+    collabs = [
+        c for c in active_collabs_for_agent(store, agent)
+        if c.get("unread_count") or c.get("inject_messages")
+    ]
+    if not collabs:
+        return []
+
+    # Cooldown: at most one collab block per conversation per window.
+    key = f"collab.prompt_last_injected.{conversation_id or ''}"
+    cooldown_min = max(0, int(cfg.collab.prompt_cooldown_minutes or 0))
+    now = datetime.datetime.now()
+    last = store.get_meta(key)
+    if last and cooldown_min:
+        try:
+            elapsed = (now - datetime.datetime.fromisoformat(last)).total_seconds()
+            if elapsed < cooldown_min * 60:
+                return []
+        except ValueError:
+            pass
+
+    lines = ["COLLAB UPDATES"]
+    for c in collabs[:3]:
+        name = c.get("name", "")
+        unread = int(c.get("unread_count", 0) or 0)
+        if unread:
+            lines.append(f"  [{name}] {unread} new message(s):")
+            for m in _collab_unread_messages(store, c, agent)[-3:]:
+                body = " ".join(str(m.get("body", "")).split())[:200]
+                author = m.get("author", "")
+                target = " (to you)" if (m.get("to") or "").strip() == agent else ""
+                lines.append(f"    - {author}{target}: {body}")
+        for m in (c.get("inject_messages") or [])[:3]:
+            text = " ".join(str(m.get("text", "")).split())[:200]
+            set_by = (m.get("set_by") or "").strip()
+            who = f" (from {set_by})" if set_by else ""
+            lines.append(f"  [{name}] COLLAB MSG: {text}{who}")
+        lines.append(f"  Check the collab: coord_read {name}")
+    if len(collabs) > 3:
+        lines.append(f"  +{len(collabs) - 3} more collabs")
+
+    store.set_meta(key, now.isoformat(timespec="seconds"))
+    return lines
+
+
 def cmd_prompt_check(args):
     """UserPromptSubmit hook: inject due reminders into conversation context.
 
@@ -2997,21 +4126,175 @@ def cmd_prompt_check(args):
     store = _store(args)
     cfg = _config(args)
 
-    if not cfg.reminders.enabled:
-        store.close()
-        return
+    from .agent_adapters import normalize_adapter, scope_adapter
+    from .agent_settings import apply_agent_overrides, resolve_agent_instance_key
 
-    due = store.due_reminders()
-    if not due:
-        store.close()
-        return
+    adapter = normalize_adapter(getattr(args, "adapter", "plain"))
+    hook_event = "UserPromptSubmit"
+    hook_payload = {}
+    conversation_id = ""
+    strict_scope = bool(getattr(args, "conversation_id", None))
+
+    # Conversation-attention checks are separate from time-due reminders.
+    attention_lines: list[str] = []
+    try:
+        from .attention import (
+            _load_state,
+            _record_attention_delivery,
+            extract_conversation_text,
+            format_attention_injections,
+            pop_pending_attention_injections,
+            read_hook_payload,
+            resolve_conversation_id,
+            run_attention_check,
+        )
+        from .budget import BudgetLedger
+
+        hook_payload = read_hook_payload()
+        strict_scope = strict_scope or bool(hook_payload)
+        hook_event = str(
+            hook_payload.get("hook_event_name")
+            or hook_payload.get("hookEventName")
+            or hook_event
+        )
+        agent_instance = resolve_agent_instance_key(
+            adapter,
+            getattr(args, "agent_instance", None),
+            hook_payload,
+        )
+        cfg = apply_agent_overrides(
+            cfg,
+            client=adapter,
+            instance_key=agent_instance,
+        )
+        conversation_text = extract_conversation_text(
+            getattr(args, "text", None),
+            hook_payload,
+        )
+        conversation_id = resolve_conversation_id(
+            getattr(args, "conversation_id", None),
+            hook_payload,
+            fallback_to_cwd=False,
+        )
+        if conversation_text and conversation_id:
+            pending = pop_pending_attention_injections(
+                store,
+                cfg,
+                conversation_id,
+                conversation_text,
+                tick=int(_load_state(store, conversation_id).get("ticks", 0)),
+            )
+            if pending:
+                _record_attention_delivery(store, cfg, conversation_id, pending)
+                attention_lines.extend(format_attention_injections(
+                    {"injections": [
+                        {
+                            "id": item.id,
+                            "title": item.title,
+                            "message": item.message,
+                            "reason": item.reason,
+                            "confidence": item.confidence,
+                        }
+                        for item in pending
+                    ]},
+                    display=cfg.attention.display,
+                ))
+            ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+            attention_result = run_attention_check(
+                store,
+                cfg,
+                ledger,
+                conversation_text,
+                conversation_id,
+                force=getattr(args, "force_attention", False),
+                adapter=scope_adapter(adapter),
+            )
+            attention_lines = format_attention_injections(
+                attention_result, display=cfg.attention.display
+            )
+    except Exception:
+        attention_lines = []
+
+    # Operator guidance is session-scoped: a new session (SessionStart) clears it
+    # and tells you once, so stale steering never silently outlives a restart.
+    sim_lines: list[str] = []
+    try:
+        if str(hook_event).lower() in ("sessionstart", "session_start"):
+            from .sim import clear_sim_guidance
+            if clear_sim_guidance(store):
+                sim_lines.append("sim guidance cleared")
+    except Exception:
+        pass
+
+    # Sim supervisory check-in (opt-in): enqueue a window snapshot for async
+    # review and surface any pending injection a prior drain already graded.
+    # Both halves are cheap (SQLite-only); the Sim/LLM spend happens in the daemon.
+    try:
+        from .sim import sim_effective_enabled
+        if conversation_id and sim_effective_enabled(store, cfg):
+            from .attention import _load_state as _att_state
+            from .sim import (
+                enqueue_sim_review,
+                format_sim_injection,
+                pop_pending_sim_injection,
+            )
+
+            tick = int(_att_state(store, conversation_id).get("ticks", 0))
+            window = ""
+            tpath = hook_payload.get("transcript_path") or hook_payload.get("transcriptPath")
+            if tpath:
+                from .reinforce import _bounded_trace
+                window = _bounded_trace(str(tpath), cfg.sim.window_chars)
+            if not window:
+                window = conversation_text
+            queued = enqueue_sim_review(store, cfg, conversation_id, window, tick=tick)
+            sim_injection = pop_pending_sim_injection(
+                store, cfg, conversation_id, window, tick=tick
+            )
+            sim_lines.extend(format_sim_injection(sim_injection, display=cfg.sim.display))
+            # No daemon? Drain off-path in the background so the review lands for
+            # a later tick. Only bother when we actually queued something new.
+            if queued and cfg.sim.drain_on_tick:
+                from .sim import spawn_background_drain
+                spawn_background_drain(cfg)
+    except Exception:
+        pass
+
+    # Collab updates: new targeted/broadcast messages since the agent's read
+    # cursor + standing inject messages, with a per-conversation cooldown.
+    collab_lines: list[str] = []
+    try:
+        collab_lines = _collab_prompt_lines(store, cfg, conversation_id)
+    except Exception:
+        collab_lines = []
+
+    due = []
+    if cfg.reminders.enabled:
+        try:
+            from .reminders import scoped_due_reminders
+            due = scoped_due_reminders(
+                store,
+                conversation_id,
+                include_global=True,
+                include_legacy=not strict_scope,
+            )
+        except Exception:
+            due = []
 
     # Also check tasks that are urgent/overdue
     task_lines = []
     try:
+        from .scoping import item_matches_conversation
         from .tasks import list_tasks
         urgent_tasks = list_tasks(store, status="open", limit=5)
         for t in urgent_tasks:
+            if not item_matches_conversation(
+                t,
+                conversation_id,
+                include_global=True,
+                include_legacy=not strict_scope,
+            ):
+                continue
             extra = t.get("extra") or {}
             p = extra.get("priority", 3)
             due_date = extra.get("due", "")
@@ -3020,6 +4303,11 @@ def cmd_prompt_check(args):
                 task_lines.append(f"  - [{p_label}] {t['title']} (id: {t['id']})")
     except Exception:
         pass
+
+    if (not due and not attention_lines and not task_lines and not sim_lines
+            and not collab_lines):
+        store.close()
+        return
 
     # ANSI codes for visual distinction
     BOLD = "\033[1m"
@@ -3031,24 +4319,40 @@ def cmd_prompt_check(args):
 
     lines = []
     lines.append(f"{BEL}<system-reminder>")
-    lines.append(f"{BOLD}{RED}{'=' * 50}")
-    lines.append(f"  KINDEX REMINDERS DUE ({len(due)})")
-    lines.append(f"{'=' * 50}{RESET}")
-    for r in due[:5]:
-        priority = r.get("priority", "normal")
-        p_color = RED if priority in ("urgent", "high") else YELLOW
-        p_marker = f" {p_color}[{priority.upper()}]{RESET}" if priority != "normal" else ""
-        extra = r.get("extra") or {}
-        lines.append(f"  {BOLD}{CYAN}-{RESET}{p_marker} {r['title']} (due: {r['next_due'][:16]}, id: {r['id']})")
-        if extra.get("action_instructions"):
-            lines.append(f"    Instructions: {extra['action_instructions'][:100]}")
-        if extra.get("action_command"):
-            lines.append(f"    Action: `{extra['action_command']}`")
-    lines.append("")
-    lines.append(f"{BOLD}Act on these NOW:{RESET}")
-    lines.append(f"  - `kin remind done <id>` to complete")
-    lines.append(f"  - `kin remind snooze <id>` to defer")
-    lines.append(f"  - `kin remind exec <id>` to run action")
+    if due:
+        lines.append(f"{BOLD}{RED}{'=' * 50}")
+        lines.append(f"  KINDEX REMINDERS DUE ({len(due)})")
+        lines.append(f"{'=' * 50}{RESET}")
+        for r in due[:5]:
+            priority = r.get("priority", "normal")
+            p_color = RED if priority in ("urgent", "high") else YELLOW
+            p_marker = f" {p_color}[{priority.upper()}]{RESET}" if priority != "normal" else ""
+            extra = r.get("extra") or {}
+            lines.append(f"  {BOLD}{CYAN}-{RESET}{p_marker} {r['title']} (due: {r['next_due'][:16]}, id: {r['id']})")
+            if extra.get("action_instructions"):
+                lines.append(f"    Instructions: {extra['action_instructions'][:100]}")
+            if extra.get("action_command"):
+                lines.append(f"    Action: `{extra['action_command']}`")
+        lines.append("")
+        lines.append(f"{BOLD}Act on these NOW:{RESET}")
+        lines.append(f"  - `kin remind done <id>` to complete")
+        lines.append(f"  - `kin remind snooze <id>` to defer")
+        lines.append(f"  - `kin remind exec <id>` to run action")
+
+    if attention_lines:
+        if due:
+            lines.append("")
+        lines.extend(attention_lines)
+
+    if sim_lines:
+        if due or attention_lines:
+            lines.append("")
+        lines.extend(sim_lines)
+
+    if collab_lines:
+        if due or attention_lines or sim_lines:
+            lines.append("")
+        lines.extend(collab_lines)
 
     if task_lines:
         lines.append("")
@@ -3057,7 +4361,406 @@ def cmd_prompt_check(args):
 
     lines.append("</system-reminder>")
 
-    print("\n".join(lines))
+    # Quiet mode: still feed the context to the model, but ask the client not to
+    # render the block to the user — they see the system working in the agent's
+    # behavior, not as background status hum. (Empirically: depends on the client
+    # honoring suppressOutput while keeping additionalContext.)
+    suppress = str(getattr(cfg.attention, "display", "full")).lower() == "quiet"
+
+    rendered = _hook_context_output(
+        "\n".join(lines),
+        # Preserve the caller's protocol. Forcing Claude here broke
+        # Antigravity quiet-mode hooks by emitting a Claude envelope.
+        adapter=adapter,
+        event=hook_event,
+        suppress=suppress,
+    )
+    if rendered:
+        print(rendered)
+    store.close()
+
+
+def cmd_attention_hook(args):
+    """Advisory attention hook for tool/action boundaries."""
+    import time
+
+    from .agent_adapters import (
+        antigravity_allow,
+        normalize_adapter,
+        permission_gate_output,
+        scope_adapter,
+    )
+    from .agent_settings import apply_agent_overrides, resolve_agent_instance_key
+    from .attention import (
+        extract_conversation_text,
+        format_attention_injections,
+        is_background_action,
+        pop_pending_attention_injections,
+        prepare_async_attention_review,
+        read_hook_payload,
+        _record_attention_delivery,
+        _load_state,
+        resolve_conversation_id,
+        wait_for_pending_attention,
+    )
+
+    payload = read_hook_payload()
+    event = str(
+        getattr(args, "event", None)
+        or payload.get("hook_event_name")
+        or payload.get("hookEventName")
+        or "PreToolUse"
+    )
+    adapter = normalize_adapter(getattr(args, "adapter", "claude"))
+    gate = permission_gate_output(adapter=adapter, event=event, payload=payload)
+    if gate:
+        print(gate)
+        return
+
+    def allow_if_needed() -> None:
+        if adapter == "antigravity" and event == "PreToolUse":
+            print(antigravity_allow())
+
+    text = extract_conversation_text(getattr(args, "text", None), payload)
+    if not text:
+        allow_if_needed()
+        return
+
+    deadline_ms = max(0, int(getattr(args, "deadline_ms", 3500) or 3500))
+    deadline = time.monotonic() + (deadline_ms / 1000.0)
+    store = None
+    try:
+        cfg = _config(args)
+        store = _hook_store(args, cfg)
+        agent_instance = resolve_agent_instance_key(
+            adapter,
+            getattr(args, "agent_instance", None),
+            payload,
+        )
+        cfg = apply_agent_overrides(cfg, client=adapter, instance_key=agent_instance)
+
+        # Ignore Kindex's own noise and local/background tool calls — attention
+        # should only weigh in on outward-facing or irreversible actions.
+        if not getattr(args, "force", False) and is_background_action(payload, cfg):
+            allow_if_needed()
+            return
+        conversation_id = resolve_conversation_id(
+            getattr(args, "conversation_id", None),
+            payload,
+            fallback_to_cwd=False,
+        )
+        if not conversation_id:
+            allow_if_needed()
+            return
+
+        delivered = pop_pending_attention_injections(
+            store,
+            cfg,
+            conversation_id,
+            text,
+            tick=int(_load_state(store, conversation_id).get("ticks", 0)),
+        )
+        if delivered:
+            _record_attention_delivery(store, cfg, conversation_id, delivered)
+
+        prepared = prepare_async_attention_review(
+            store,
+            cfg,
+            text,
+            conversation_id,
+            force=getattr(args, "force", False),
+            adapter=scope_adapter(adapter),
+        )
+        job = prepared.get("job") or {}
+        if job and time.monotonic() < deadline:
+            immediate = wait_for_pending_attention(
+                store,
+                cfg,
+                conversation_id,
+                text,
+                tick=int(prepared.get("ticks", 0) or 0),
+                job_id=str(job.get("job_id") or ""),
+                deadline=deadline,
+            )
+            if immediate:
+                _record_attention_delivery(store, cfg, conversation_id, immediate)
+                delivered.extend(immediate)
+
+        deduped: list = []
+        seen = set()
+        for injection in delivered:
+            key = (injection.id, injection.message)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(injection)
+        if not deduped:
+            allow_if_needed()
+            return
+
+        result = {"injections": [
+            {
+                "id": item.id,
+                "title": item.title,
+                "message": item.message,
+                "reason": item.reason,
+                "confidence": item.confidence,
+            }
+            for item in deduped
+        ]}
+        lines = format_attention_injections(result, display=cfg.attention.display)
+        if not lines:
+            allow_if_needed()
+            return
+        rendered = _hook_context_output(
+            "\n".join(lines),
+            adapter=adapter,
+            event=event,
+            suppress=str(getattr(cfg.attention, "display", "full")).lower() == "quiet",
+        )
+        if rendered:
+            print(rendered)
+    except Exception:
+        allow_if_needed()
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+
+def cmd_sim(args):
+    """Runtime controls for the Sim supervisory check-in."""
+    store = _store(args)
+    cfg = _config(args)
+    action = getattr(args, "sim_action", "status")
+
+    from .sim import (
+        call_sim,
+        clear_sim_guidance,
+        clear_sim_override,
+        drain_sim_queue,
+        get_sim_guidance,
+        set_sim_enabled,
+        set_sim_guidance,
+        sim_status,
+    )
+
+    if action == "guidance":
+        if getattr(args, "clear", False):
+            clear_sim_guidance(store)
+            print("Sim guidance cleared.")
+            store.close()
+            return
+        text = (getattr(args, "text", None) or "").strip()
+        if text:
+            set_sim_guidance(store, text)
+            print(f"Sim guidance set (clears on restart):\n  {text}")
+        else:
+            current = get_sim_guidance(store)
+            print(f"Sim guidance: {current}" if current else "Sim guidance: (none)")
+        store.close()
+        return
+
+    if action in ("on", "enable"):
+        set_sim_enabled(store, True)
+        print("Sim supervisory check-in enabled (runtime override).")
+        store.close()
+        return
+
+    if action in ("off", "disable"):
+        set_sim_enabled(store, False)
+        print("Sim supervisory check-in disabled (runtime override). Use `kin sim inherit` to follow config again.")
+        store.close()
+        return
+
+    if action == "inherit":
+        clear_sim_override(store)
+        print("Sim runtime override cleared; config.sim.enabled now governs.")
+        store.close()
+        return
+
+    if action == "drain":
+        result = drain_sim_queue(store, cfg)
+        print(_dumps(result, indent=2))
+        store.close()
+        return
+
+    if action == "check":
+        # Manual one-shot review of a window from --text or stdin (ignores the
+        # threshold — shows the raw rating/note so you can calibrate).
+        text = getattr(args, "text", None) or ""
+        if not text and not sys.stdin.isatty():
+            text = sys.stdin.read()
+        if not text.strip():
+            print("Error: sim check needs --text or a window on stdin", file=sys.stderr)
+            store.close()
+            sys.exit(1)
+        from .budget import BudgetLedger
+        ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+        result, acct = call_sim(cfg, ledger, text, "sim-check", client=None)
+        payload = {"status": acct.get("status")}
+        if result:
+            payload.update({"rating": result.rating, "note": result.note,
+                            "basis": result.basis,
+                            "would_inject": result.rating >= cfg.sim.threshold})
+        print(_dumps(payload, indent=2))
+        store.close()
+        return
+
+    # status (default)
+    print(_dumps(sim_status(store, cfg), indent=2))
+    store.close()
+
+
+def cmd_attention(args):
+    """Runtime controls for conversation-attention checks."""
+    store = _store(args)
+    cfg = _config(args)
+    action = getattr(args, "attention_action", "status")
+    conversation_id = getattr(args, "conversation_id", None)
+
+    from .attention import (
+        clear_runtime_enabled,
+        drain_attention_queue,
+        extract_conversation_text,
+        estimate_message_window,
+        format_attention_injections,
+        parse_hook_payload,
+        resolve_conversation_id,
+        run_attention_check,
+        runtime_status,
+        set_runtime_enabled,
+    )
+    from .budget import BudgetLedger
+
+    if action == "on":
+        set_runtime_enabled(store, True, conversation_id=conversation_id)
+        scope = f"conversation {conversation_id}" if conversation_id else "global runtime"
+        print(f"Attention enabled ({scope}).")
+        store.close()
+        return
+
+    if action == "off":
+        set_runtime_enabled(store, False, conversation_id=conversation_id)
+        scope = f"conversation {conversation_id}" if conversation_id else "global runtime"
+        print(f"Attention disabled ({scope}).")
+        store.close()
+        return
+
+    if action == "inherit":
+        clear_runtime_enabled(store, conversation_id=conversation_id)
+        scope = f"conversation {conversation_id}" if conversation_id else "global runtime"
+        print(f"Attention override cleared ({scope}).")
+        store.close()
+        return
+
+    if action == "drain":
+        result = drain_attention_queue(store, cfg)
+        print(_dumps(result, indent=2))
+        store.close()
+        return
+
+    if action == "check":
+        raw = ""
+        if not getattr(args, "text", None) and not sys.stdin.isatty():
+            raw = sys.stdin.read()
+        payload = parse_hook_payload(raw)
+        conversation_id = resolve_conversation_id(conversation_id, payload)
+        text = extract_conversation_text(getattr(args, "text", None), payload)
+        if not text:
+            print("Error: attention check needs --text or hook JSON on stdin", file=sys.stderr)
+            store.close()
+            sys.exit(1)
+        ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+        result = run_attention_check(
+            store,
+            cfg,
+            ledger,
+            text,
+            conversation_id,
+            force=getattr(args, "force", False),
+        )
+        if getattr(args, "json", False):
+            print(_dumps(result, indent=2))
+        else:
+            lines = format_attention_injections(result)
+            if lines:
+                print("\n".join(lines))
+            else:
+                print(f"No attention injection ({result.get('status')}).")
+        store.close()
+        return
+
+    if action == "reinforce":
+        # Session-end grading: read the trace (transcript/summary) from --text or stdin.
+        raw = ""
+        if not getattr(args, "text", None) and not sys.stdin.isatty():
+            raw = sys.stdin.read()
+        payload = parse_hook_payload(raw)
+        conversation_id = resolve_conversation_id(conversation_id, payload)
+
+        # --enqueue: super-lightweight hook path — record for later cron grading
+        # and return SILENTLY (no LLM, no output). Used by Stop / PreCompact.
+        if getattr(args, "enqueue", False):
+            from .reinforce import enqueue_reinforce
+            transcript_path = (payload.get("transcript_path")
+                               or payload.get("transcriptPath") or "")
+            enqueue_reinforce(store, conversation_id, transcript_path=transcript_path)
+            store.close()
+            return
+
+        trace = extract_conversation_text(getattr(args, "text", None), payload) or raw
+        from .reinforce import reinforce_session
+        ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+        result = reinforce_session(store, cfg, conversation_id, trace, ledger=ledger)
+        if getattr(args, "json", False):
+            print(_dumps(result, indent=2))
+        else:
+            outs = result.get("outcomes", [])
+            obs = sum(1 for o in outs if o.get("injected"))
+            cf = sum(1 for o in outs if not o.get("injected"))
+            print(f"Reinforcement ({result.get('status')}): "
+                  f"{obs} confirmed-useful, {cf} counterfactual, "
+                  f"{len(result.get('gaps', []))} knowledge gap(s).")
+            for o in outs:
+                kind = "used" if o.get("injected") else "missed"
+                print(f"  [{kind}/{o.get('category')}] +{o.get('amount')} {o.get('title','')[:60]}")
+        store.close()
+        return
+
+    if action == "budget":
+        ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+        resolved = conversation_id or ""
+        summary = ledger.summary(conversation_id=resolved or None)
+        if getattr(args, "json", False):
+            print(_dumps(summary, indent=2))
+        else:
+            print(yaml.dump(summary, default_flow_style=False, sort_keys=False).strip())
+        store.close()
+        return
+
+    if action == "estimate":
+        ledger = BudgetLedger(cfg.ledger_path, cfg.budget)
+        messages = getattr(args, "messages", None) or 100
+        estimate = estimate_message_window(
+            cfg,
+            messages=messages,
+            observed_entries=ledger.entries,
+        )
+        if getattr(args, "json", False):
+            print(_dumps(estimate, indent=2))
+        else:
+            print(yaml.dump(estimate, default_flow_style=False, sort_keys=False).strip())
+        store.close()
+        return
+
+    status = runtime_status(store, cfg, conversation_id)
+    if getattr(args, "json", False):
+        print(_dumps(status, indent=2))
+    else:
+        print(yaml.dump(status, default_flow_style=False, sort_keys=False).strip())
     store.close()
 
 
@@ -3278,13 +4981,17 @@ def cmd_setup_hooks(args):
             data = _json.loads(settings_path.read_text())
             hooks = data.get("hooks", {})
             changed = False
-            for key in ["SessionStart", "PreCompact"]:
+            for key in ["SessionStart", "PreCompact", "UserPromptSubmit", "PreToolUse", "Stop"]:
                 if key in hooks:
                     before = len(hooks[key])
                     hooks[key] = [
                         h for h in hooks[key]
                         if "kin prime" not in str(h)
                         and "compact-hook" not in str(h)
+                        and "prompt-check" not in str(h)
+                        and "attention-hook" not in str(h)
+                        and "stop-guard" not in str(h)
+                        and "dream --detach" not in str(h)
                         and "kindex" not in str(h).lower()
                     ]
                     if len(hooks[key]) < before:
@@ -3300,6 +5007,22 @@ def cmd_setup_hooks(args):
         return
 
     actions = install_claude_hooks(cfg, dry_run=dry_run)
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_codex_hooks(args):
+    """Install/uninstall Kindex prompt-time hooks in Codex."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_codex_hooks
+        actions = uninstall_codex_hooks(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_codex_hooks
+        actions = install_codex_hooks(cfg, dry_run=dry_run)
+
     for a in actions:
         print(f"  {a}")
 
@@ -3333,29 +5056,36 @@ def cmd_setup_cron(args):
 
     if getattr(args, "uninstall", False):
         if method == "launchd":
-            from .setup import uninstall_launchd
+            from .setup import uninstall_launchd, uninstall_reminder_daemon
             actions = uninstall_launchd(dry_run=dry_run)
+            actions += uninstall_reminder_daemon(dry_run=dry_run)
         else:
-            # Remove crontab entry
+            # Remove crontab entries (maintenance + reminder check)
             import subprocess
             result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
             if result.returncode == 0:
                 lines = result.stdout.splitlines()
-                filtered = [l for l in lines if "kin cron" not in l and "kindex" not in l]
+                # Match only our installed shapes — a bare "remind check"
+                # marker could delete an unrelated user line.
+                from .setup import is_kindex_cron_line
+                filtered = [l for l in lines if not is_kindex_cron_line(l)]
                 if len(filtered) < len(lines):
                     if not dry_run:
                         new_crontab = "\n".join(filtered) + "\n"
                         subprocess.run(["crontab", "-"], input=new_crontab,
                                        capture_output=True, text=True)
-                    actions = ["Removed crontab entry"]
+                    actions = ["Removed crontab entries"]
                 else:
                     actions = ["No crontab entry found"]
             else:
                 actions = ["No crontab found"]
     else:
+        # Install the maintenance job AND a dedicated reminder-check job:
+        # reminder delivery must never wait behind a slow maintenance run.
         if method == "launchd":
-            from .setup import install_launchd
+            from .setup import install_launchd, install_reminder_daemon
             actions = install_launchd(cfg, dry_run=dry_run)
+            actions += install_reminder_daemon(cfg, dry_run=dry_run)
         else:
             from .setup import install_crontab
             actions = install_crontab(cfg, dry_run=dry_run)
@@ -3418,6 +5148,162 @@ def cmd_setup_agents_md(args):
         print(block)
 
 
+def cmd_setup_gemini_mcp(args):
+    """Install/uninstall Kindex as a Gemini CLI MCP server."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_gemini_mcp
+        actions = uninstall_gemini_mcp(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_gemini_mcp
+        actions = install_gemini_mcp(cfg, dry_run=dry_run)
+
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_gemini_md(args):
+    """Output recommended GEMINI.md block for Gemini CLI/kindex integration.
+
+    kin setup-gemini-md           — print to stdout
+    kin setup-gemini-md --install — append to ~/.gemini/GEMINI.md if not present
+    """
+    block = _kindex_agents_md_block()
+
+    if getattr(args, "install", False):
+        cfg = _config(args)
+        gemini_md = cfg.gemini_path / "GEMINI.md"
+        if gemini_md.exists():
+            existing = gemini_md.read_text()
+            if "Kindex (REQUIRED" in existing or "kindex MCP tools" in existing:
+                print(f"Kindex directives already present in {gemini_md}")
+                return
+            with open(gemini_md, "a") as f:
+                f.write("\n" + block)
+            print(f"Appended kindex directives to {gemini_md}")
+        else:
+            gemini_md.parent.mkdir(parents=True, exist_ok=True)
+            gemini_md.write_text(block)
+            print(f"Created {gemini_md} with kindex directives")
+    else:
+        print(block)
+
+
+def cmd_setup_antigravity_mcp(args):
+    """Install/uninstall Kindex as an Antigravity MCP server."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_antigravity_mcp
+        actions = uninstall_antigravity_mcp(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_antigravity_mcp
+        actions = install_antigravity_mcp(cfg, dry_run=dry_run)
+
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_antigravity_hooks(args):
+    """Install/uninstall Kindex lifecycle hooks in Antigravity."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_antigravity_hooks
+        actions = uninstall_antigravity_hooks(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_antigravity_hooks
+        actions = install_antigravity_hooks(cfg, dry_run=dry_run)
+
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_antigravity_md(args):
+    """Output recommended Antigravity/GEMINI.md Kindex directives."""
+    cmd_setup_gemini_md(args)
+
+
+def cmd_setup_opencode_mcp(args):
+    """Install/uninstall Kindex as an OpenCode MCP server."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_opencode_mcp
+        actions = uninstall_opencode_mcp(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_opencode_mcp
+        actions = install_opencode_mcp(cfg, dry_run=dry_run)
+
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_cursor_mcp(args):
+    """Install/uninstall Kindex as a Cursor MCP server."""
+    cfg = _config(args)
+    dry_run = getattr(args, "dry_run", False)
+
+    if getattr(args, "uninstall", False):
+        from .setup import uninstall_cursor_mcp
+        actions = uninstall_cursor_mcp(cfg, dry_run=dry_run)
+    else:
+        from .setup import install_cursor_mcp
+        actions = install_cursor_mcp(cfg, dry_run=dry_run)
+
+    for a in actions:
+        print(f"  {a}")
+
+
+def cmd_setup_cursor_rules(args):
+    """Output recommended Cursor rule for kindex integration.
+
+    kin setup-cursor-rules           — print to stdout
+    kin setup-cursor-rules --install — write ~/.cursor/rules/kindex.mdc if not present
+    """
+    block = _kindex_cursor_rule_block()
+
+    if getattr(args, "install", False):
+        cfg = _config(args)
+        rule_path = cfg.cursor_path / "rules" / "kindex.mdc"
+        if rule_path.exists():
+            print(f"Kindex Cursor rule already present at {rule_path}")
+            return
+        rule_path.parent.mkdir(parents=True, exist_ok=True)
+        rule_path.write_text(block)
+        print(f"Created {rule_path} with kindex directives")
+    else:
+        print(block)
+
+
+def cmd_setup_merge(args):
+    """Install/uninstall the .kin structured merge driver in the current git repo."""
+    from .setup import git_repo_root, install_merge_driver, uninstall_merge_driver
+
+    root = git_repo_root(getattr(args, "project_path", None) or os.getcwd())
+    if root is None:
+        print("Error: setup-merge must run inside a git repository", file=sys.stderr)
+        sys.exit(1)
+    dry_run = getattr(args, "dry_run", False)
+    uninstall = getattr(args, "uninstall", False)
+    actions = (uninstall_merge_driver if uninstall else install_merge_driver)(
+        root, dry_run=dry_run
+    )
+    for a in actions:
+        print(f"  {a}")
+    if not uninstall and not dry_run:
+        print(
+            "\n.kin/index.json and .kin/code-map.json now merge via `kin merge-kin`.\n"
+            "Commit the updated .gitattributes so collaborators inherit it; each\n"
+            "clone runs `kin setup-merge` once to register the local driver."
+        )
+
+
 def _kindex_claude_md_block() -> str:
     """Generate the recommended CLAUDE.md block for kindex integration."""
     return """\
@@ -3431,10 +5317,24 @@ Kindex is a persistent knowledge graph. MCP tools (`search`, `add`, `context`, \
 ### Session lifecycle (do this every session)
 1. **Start**: call `tag_start` with a name and focus for the current task, OR \
 `tag_resume` if continuing previous work
-2. **During**: follow the capture rules below -- this is the whole point of kindex
-3. **Segment**: when switching topics, call `tag_update` with `action=segment`, \
+2. **Policy**: if the repo has `.kin/config`, treat it as tracked project context. \
+Run `kin policy check --event agent-start` when shell access is available.
+3. **During**: follow the capture rules below -- this is the whole point of kindex
+4. **Segment**: when switching topics, call `tag_update` with `action=segment`, \
 summarizing what was done
-4. **End**: call `tag_update` with `action=end` and a summary before the session closes
+5. **End**: call `tag_update` with `action=end` and a summary before the session closes
+
+### Project `.kin/` contract
+- `.kin/config` and `.kin/index.json` are repo-shipped project artifacts, not \
+private cache.
+- `.kin/index.json` and `.kin/code-map.json` are generated, id-keyed snapshots: \
+never hand-resolve git conflicts in them. `kin index` auto-registers a structured \
+merge driver (`kin merge-kin`) on first run that unions them losslessly; run \
+`kin setup-merge` to (re)install it in a fresh clone.
+- Local-only state belongs in `~/.kindex` or ignored `.kin/local`, `.kin/cache`, \
+`.kin/tmp`, `.kin/private`.
+- Linear enforcement is opt-in. Only enforce Linear when local `.kin/config` \
+sets `work_policy.linear.enabled: true`.
 
 ### What to capture (use MCP `add` tool or `learn` for bulk text)
 - **Discoveries**: new patterns, surprising findings, "aha" moments -- `add` as concept
@@ -3462,8 +5362,9 @@ multiple concepts at once
 - After a complex multi-step task: use `learn` with a summary of what happened and why
 
 ### Reminders with actions
-- Use `remind_create` with `action` and/or `instructions` for deferred tasks
-- The daemon will execute shell commands or launch headless Claude when they come due
+- Use `remind_create` with `action`, `instructions`, or `wake` for deferred tasks
+- The daemon will execute shell commands or launch headless Claude/Codex/OpenCode
+  when they come due
 """
 
 
@@ -3486,11 +5387,20 @@ the `kindex` MCP server. Use them proactively.
 `tag_resume` if continuing previous work.
 2. **Orient**: call `search` or `context` before significant work to see what is \
 already known.
-3. **During**: capture important discoveries, decisions, tasks, and connections as \
+3. **Policy**: if the repo has `.kin/config`, treat it as tracked project context. \
+Run `kin policy check --event agent-start` when shell access is available.
+4. **During**: capture important discoveries, decisions, tasks, and connections as \
 they happen.
-4. **Segment**: when switching topics, call `tag_update` with `action=segment` and \
+5. **Segment**: when switching topics, call `tag_update` with `action=segment` and \
 a concise summary.
-5. **End**: call `tag_update` with `action=end` and a summary before the session closes.
+6. **End**: call `tag_update` with `action=end` and a summary before the session closes.
+
+### Project `.kin/` contract
+- `.kin/config` and `.kin/index.json` are repo-shipped project artifacts, not private cache.
+- `.kin/index.json` and `.kin/code-map.json` are generated, id-keyed snapshots: never hand-resolve git conflicts in them. `kin index` auto-registers a structured merge driver (`kin merge-kin`) that unions them losslessly; run `kin setup-merge` to (re)install it in a fresh clone.
+- Local-only state belongs in `~/.kindex` or ignored `.kin/local`, `.kin/cache`, `.kin/tmp`, `.kin/private`.
+- Linear enforcement is opt-in. Only enforce Linear when local `.kin/config` sets `work_policy.linear.enabled: true`.
+- If no work policy is present, continue normally and still use kindex for search/capture.
 
 ### What to capture
 - **Discoveries**: new patterns, surprising findings, "aha" moments -- `add` as concept
@@ -3512,6 +5422,18 @@ a concise summary.
 ### Working rule
 Do not wait for the user to mention kindex. Treat it as your durable memory layer.
 """
+
+
+def _kindex_cursor_rule_block() -> str:
+    """Generate a Cursor rule (.mdc) for kindex integration. Always-applied scope."""
+    body = _kindex_agents_md_block()
+    return (
+        "---\n"
+        "description: Use kindex MCP tools as durable memory across sessions\n"
+        "alwaysApply: true\n"
+        "---\n\n"
+        + body
+    )
 
 
 # ── config ────────────────────────────────────────────────────────────
@@ -3554,7 +5476,8 @@ def cmd_config(args):
             sys.exit(1)
         is_global = getattr(args, "global_", False)
         _config_write(args.key, args.value, getattr(args, "config", None),
-                      global_=is_global)
+                      global_=is_global,
+                      project_path=getattr(args, "project_path", None))
         scope = "global" if is_global else "local"
         print(f"Set {args.key} = {args.value} ({scope})")
         return
@@ -3562,6 +5485,150 @@ def cmd_config(args):
     # Default: show
     cfg = _config(args)
     print(yaml.dump(cfg.model_dump(), default_flow_style=False, sort_keys=False).strip())
+
+
+def cmd_agent_config(args):
+    """Show or set per-client/per-instance agent behavior overrides."""
+    from .agent_settings import (
+        agent_config_write_key,
+        agent_settings_summary,
+        normalize_agent_client,
+        resolve_agent_instance_key,
+        validate_agent_setting_key,
+    )
+
+    action = getattr(args, "agent_config_action", "show")
+    client = normalize_agent_client(getattr(args, "client", None))
+    if not client or client == "plain":
+        print("Error: agent-config requires --client <claude|codex|antigravity|...>",
+              file=sys.stderr)
+        sys.exit(1)
+    instance_key = resolve_agent_instance_key(
+        client,
+        getattr(args, "instance", None),
+        {},
+    )
+
+    if action == "show":
+        cfg = _config(args)
+        summary = agent_settings_summary(
+            cfg,
+            client=client,
+            instance_key=instance_key,
+        )
+        if getattr(args, "json", False):
+            print(_dumps(summary, indent=2))
+        else:
+            print(yaml.dump(summary, default_flow_style=False, sort_keys=False).strip())
+        return
+
+    if action == "set":
+        key = getattr(args, "key", None)
+        value = getattr(args, "value", None)
+        if not key or value is None:
+            print("Error: kin agent-config set <key> <value> --client <client>",
+                  file=sys.stderr)
+            sys.exit(1)
+        try:
+            setting_key = validate_agent_setting_key(key)
+            scope = getattr(args, "scope", "client")
+            write_key = agent_config_write_key(
+                scope=scope,
+                client=client,
+                instance_key=instance_key,
+                setting_key=setting_key,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        config_path = getattr(args, "config", None)
+        is_global = getattr(args, "global_", False)
+        project_path = getattr(args, "project_path", None)
+        if getattr(args, "scope", "client") == "instance":
+            _config_write(
+                f"agents.instances.{instance_key}.client",
+                client,
+                config_path,
+                global_=is_global,
+                project_path=project_path,
+            )
+        _config_write(
+            write_key,
+            value,
+            config_path,
+            global_=is_global,
+            project_path=project_path,
+        )
+        scope_label = getattr(args, "scope", "client")
+        target = client if scope_label == "client" else instance_key
+        file_scope = "global" if is_global else "local"
+        print(f"Set {setting_key} = {value} ({scope_label}: {target}, {file_scope})")
+        return
+
+    print(f"Error: unknown agent-config action '{action}'", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── policy ────────────────────────────────────────────────────────────
+
+def cmd_policy(args):
+    """Evaluate project work policy from tracked .kin config."""
+    action = getattr(args, "policy_action", "show")
+    cfg = _config(args)
+    policy = cfg.work_policy
+
+    if action == "show":
+        print(yaml.dump(policy.model_dump(), default_flow_style=False, sort_keys=False).strip())
+        return
+
+    if action == "check":
+        event = getattr(args, "event", None) or "manual"
+        strict = getattr(args, "strict", False)
+        failures: list[str] = []
+        warnings: list[str] = []
+
+        require_tag = policy.require_active_tag
+        if event == "pre-commit" and policy.git.block_commit_without_tag:
+            require_tag = True
+        if event == "pre-push" and policy.git.block_push_without_tag:
+            require_tag = True
+
+        if require_tag:
+            from .sessions import get_active_tag
+            from .config import resolve_project_root
+            store = _store(args)
+            project_root = str(resolve_project_root(getattr(args, "project_path", None)))
+            active = get_active_tag(store, project_path=project_root)
+            store.close()
+            if not active:
+                failures.append(f"no active kindex session tag for project {project_root}")
+
+        linear_required = policy.linear.enabled and policy.linear.require_issue
+        if event == "pre-commit" and policy.git.block_commit_without_linear:
+            linear_required = True
+        if event == "pre-push" and policy.git.block_push_without_linear:
+            linear_required = True
+
+        if linear_required:
+            identifier = os.environ.get("KIN_LINEAR_ID") or os.environ.get("LINEAR_ISSUE")
+            if not identifier:
+                failures.append("Linear issue required by project policy; set KIN_LINEAR_ID or LINEAR_ISSUE")
+            if policy.linear.enabled and not os.environ.get("LINEAR_API_KEY"):
+                warnings.append("LINEAR_API_KEY is not set; issue state cannot be verified")
+
+        if not failures and not warnings:
+            print(f"Policy check passed ({event}).")
+            return
+
+        for warning in warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
+        for failure in failures:
+            print(f"Policy violation: {failure}", file=sys.stderr)
+
+        if failures and (strict or event in {"pre-commit", "pre-push"}):
+            sys.exit(1)
+        return
 
 
 def _dotget(d: dict, key: str):
@@ -3609,13 +5676,15 @@ def _coerce_value(value: str):
 
 
 def _config_write(key: str, value: str, config_path: str | None = None,
-                   global_: bool = False) -> None:
+                   global_: bool = False,
+                   project_path: str | None = None) -> None:
     """Write a config value to the appropriate config file.
 
     Resolution (like git config):
     - --config <path>:  explicit file
     - --global:         user-level (~/.config/kindex/kin.yaml)
-    - default:          local file if one exists in cwd, else global
+    - default:          project .kin/config, discovered from --project-path,
+                        KIN_PROJECT, git root, then cwd
     """
     import yaml
 
@@ -3633,23 +5702,17 @@ def _config_write(key: str, value: str, config_path: str | None = None,
             path = Path.home() / ".config" / "kindex" / "kin.yaml"
             path.parent.mkdir(parents=True, exist_ok=True)
     else:
-        from .config import _LOCAL_PATHS, _GLOBAL_PATHS, _maybe_upgrade_kin_file
+        from .config import _maybe_upgrade_kin_file, _project_config_paths, resolve_project_root
         # Auto-upgrade old .kin file before searching local paths
-        _maybe_upgrade_kin_file(Path(".kin").expanduser().resolve())
+        root = resolve_project_root(project_path)
+        _maybe_upgrade_kin_file((root / ".kin").expanduser().resolve())
         path = None
-        for p in _LOCAL_PATHS:
-            p = p.expanduser().resolve()
+        for p in _project_config_paths(root):
             if p.exists():
                 path = p
                 break
         if path is None:
-            for p in _GLOBAL_PATHS:
-                p = p.expanduser().resolve()
-                if p.exists():
-                    path = p
-                    break
-        if path is None:
-            path = Path.home() / ".config" / "kindex" / "kin.yaml"
+            path = root / ".kin" / "config"
             path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load existing or start fresh
@@ -3665,8 +5728,10 @@ def _config_write(key: str, value: str, config_path: str | None = None,
 # ── parser ─────────────────────────────────────────────────────────────
 
 def _common(p):
-    p.add_argument("--config", help="Path to conv.yaml")
+    p.add_argument("--config", help="Explicit config file (bypasses layering)")
     p.add_argument("--data-dir", help="Override data directory")
+    p.add_argument("--profile", help="Use a named kindex profile (overrides auto-resolution)")
+    p.add_argument("--project-path", help="Project root/path for .kin config lookup")
     p.add_argument("--json", action="store_true", help="JSON output")
 
 
@@ -3709,6 +5774,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--owner", help="Person responsible (for watches/directives)")
     s.add_argument("--expires", help="Expiry date YYYY-MM-DD (for watches)")
     s.add_argument("--resets", help="Reset schedule (e.g. monday, monthly)")
+    s.add_argument("--attention-trigger",
+                   help="Comma-separated conversation trigger terms for attention injection")
     s.add_argument("--audience", choices=["private", "team", "org", "public"],
                    help="Audience scope")
     s.add_argument("--tags", help="Comma-separated tags for contextual surfacing")
@@ -3772,6 +5839,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # budget
     s = sub.add_parser("budget", help="LLM budget usage")
+    s.add_argument("--conversation-id", help="Show spend for one conversation")
     _common(s)
     s.set_defaults(func=cmd_budget)
 
@@ -3806,10 +5874,40 @@ def build_parser() -> argparse.ArgumentParser:
     _common(s)
     s.set_defaults(func=cmd_set_state)
 
+    # edit
+    s = sub.add_parser("edit", help="Policy-aware in-place edit of a node")
+    s.add_argument("node_id", help="Node ID or title")
+    s.add_argument("--title", help="Replace the title")
+    s.add_argument("--content", help="Replace the content")
+    s.add_argument("--append", help="Append a dated addendum to the content")
+    s.add_argument("--add-tags", dest="add_tags", help="Comma-separated tags to add")
+    s.add_argument("--remove-tags", dest="remove_tags", help="Comma-separated tags to remove")
+    s.add_argument("--intent", help="Replace the intent")
+    s.add_argument("--expires", help="Set expiry date (YYYY-MM-DD)")
+    s.add_argument("--force", action="store_true", help="Override a foreign lock")
+    _common(s)
+    s.set_defaults(func=cmd_edit)
+
+    # supersede
+    s = sub.add_parser("supersede", help="Replace a node with a new one, preserving history")
+    s.add_argument("node_id", help="Node ID or title")
+    s.add_argument("text", nargs="+", help="Replacement text")
+    s.add_argument("--expires", help="Expiry date for the new node (YYYY-MM-DD)")
+    s.add_argument("--reason", help="Why the node is being replaced")
+    _common(s)
+    s.set_defaults(func=cmd_supersede)
+
     # export
     s = sub.add_parser("export", help="Export graph (audience-aware)")
+    s.add_argument("export_kind", nargs="?", choices=["graph", "code-map"], default="graph",
+                   help="Export graph (default) or a UA-compatible code map")
     s.add_argument("--audience", choices=["private", "team", "org", "public"], default="team")
-    s.add_argument("--format", choices=["json", "jsonl"], default="json")
+    s.add_argument("--format", choices=["json", "jsonl", "understand-anything"], default="json")
+    s.add_argument("--directory", help="Repository root for code-map metadata")
+    s.add_argument("--project-name", help="Project name for code-map export")
+    s.add_argument("--output", help="Write export to this file instead of stdout")
+    s.add_argument("--limit", type=int, default=10000,
+                   help="Maximum nodes to scan for export (default 10000)")
     _common(s)
     s.set_defaults(func=cmd_export)
 
@@ -3823,13 +5921,20 @@ def build_parser() -> argparse.ArgumentParser:
         _adapter_names = ["projects", "sessions", "files", "commits", "github", "linear"]
     s.add_argument("source", choices=_adapter_names + ["all"],
                    help="Adapter name or 'all' for all available sources")
-    s.add_argument("--limit", type=int, default=50, help="Max items to ingest")
+    s.add_argument("--limit", type=int, default=None,
+                   help="Max items to ingest (0 = unlimited; default depends on "
+                        "adapter — code is unlimited, network/LLM adapters cap at 50)")
     s.add_argument("--repo", type=str, default=None, help="GitHub owner/repo (e.g. jmcentire/kindex)")
     s.add_argument("--repo-path", type=str, default=None,
                    help="Local repository path (for commits source)")
     s.add_argument("--since", type=str, default=None, help="ISO date to filter items created after")
     s.add_argument("--team", type=str, default=None, help="Linear team key (for linear source)")
     s.add_argument("--directory", type=str, default=None, help="Directory to ingest (for files source)")
+    # default=None so an absent flag defers to the project's .kin/config
+    # code_ingest.unity setting
+    s.add_argument("--unity", action="store_true", default=None,
+                   help="Include Unity asset files (.unity/.prefab/.asset) and "
+                        ".meta GUIDs (code source; also via .kin/config code_ingest.unity)")
     _common(s)
     s.set_defaults(func=cmd_ingest)
 
@@ -3871,6 +5976,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Output mode: hook (raw block) or stdout (with header)")
     s.add_argument("--codebook", action="store_true",
                    help="Regenerate the LLM prompt cache codebook")
+    s.add_argument("--conversation-id", help="Conversation/session id for scoped reminders")
+    s.add_argument("--adapter", default="claude",
+                   choices=["plain", "claude", "codex", "antigravity"],
+                   help="Hook output adapter for client hook protocols")
+    s.add_argument("--agent-instance", help="Agent instance/conversation override key")
     _common(s)
     s.set_defaults(func=cmd_prime)
 
@@ -3915,13 +6025,65 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_alias)
 
     # whoami
-    s = sub.add_parser("whoami", help="Show current user identity")
+    s = sub.add_parser("whoami", help="Show current user and agent identity")
     _common(s)
     s.set_defaults(func=cmd_whoami)
 
+    # profile
+    s = sub.add_parser("profile", help="Named graph profiles (list, which, create)")
+    s.add_argument("profile_action", nargs="?", default="list",
+                   choices=["list", "which", "create"])
+    s.add_argument("name", nargs="?", help="Profile name (for create)")
+    s.add_argument("--roots", help="Comma-separated roots routed to this profile (for create)")
+    s.add_argument("--default", dest="set_default", action="store_true",
+                   help="Set as default_profile (for create)")
+    _common(s)
+    s.set_defaults(func=cmd_profile)
+
     # embed
-    s = sub.add_parser("embed", help="Index all nodes for vector search")
+    s = sub.add_parser("embed", help="Index and maintain vector search")
     s.add_argument("--verbose", "-v", action="store_true")
+    embed_sub = s.add_subparsers(dest="embed_action")
+
+    def _embed_filters(parser):
+        parser.add_argument("--tags", help="Comma-separated tags/domains to target")
+        parser.add_argument("--node-type", help="Target one node type")
+        parser.add_argument("--status", help="Target one node status")
+        parser.add_argument("--since", help="Only nodes updated since this ISO timestamp")
+        parser.add_argument("--target", help="Target nodes under a project path")
+        parser.add_argument("--kin", help="Target a project .kin directory or .kin/config")
+        parser.add_argument("--stale", action="store_true",
+                            help="Only nodes missing current embedding metadata")
+        parser.add_argument("--limit", type=int, help="Maximum nodes to target")
+
+    for name, help_text in (
+        ("plan", "Estimate selected reindex work"),
+        ("enqueue", "Queue selected nodes for gradual embedding maintenance"),
+        ("reindex", "Run selected reindex work now, or enqueue with --enqueue"),
+    ):
+        es = embed_sub.add_parser(name, help=help_text)
+        _embed_filters(es)
+        if name in {"enqueue", "reindex"}:
+            es.add_argument("--max-queue", type=int, help="Maximum retained queue size")
+        if name == "reindex":
+            es.add_argument("--enqueue", action="store_true",
+                            help="Queue work instead of running synchronously")
+            es.add_argument("--verbose", "-v", action="store_true")
+        _common(es)
+        es.set_defaults(func=cmd_embed)
+
+    es = embed_sub.add_parser("drain", help="Drain queued embedding work")
+    es.add_argument("--max-jobs", type=int, help="Maximum queued nodes to embed")
+    es.add_argument("--time-budget", type=float, dest="time_budget",
+                    help="Wall-clock seconds cap (0 = unlimited; "
+                         "default: embedding.drain_time_budget)")
+    _common(es)
+    es.set_defaults(func=cmd_embed)
+
+    es = embed_sub.add_parser("status", help="Show embedding index status")
+    _common(es)
+    es.set_defaults(func=cmd_embed)
+
     _common(s)
     s.set_defaults(func=cmd_embed)
 
@@ -3944,6 +6106,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--uninstall", action="store_true", help="Remove installed hooks")
     _common(s)
     s.set_defaults(func=cmd_setup_hooks)
+
+    # setup-codex-hooks
+    s = sub.add_parser("setup-codex-hooks", help="Install Kindex prompt hooks into Codex")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed hooks")
+    _common(s)
+    s.set_defaults(func=cmd_setup_codex_hooks)
 
     # setup-codex-mcp
     s = sub.add_parser("setup-codex-mcp", help="Install Kindex MCP server into Codex")
@@ -3979,6 +6148,67 @@ def build_parser() -> argparse.ArgumentParser:
     _common(s)
     s.set_defaults(func=cmd_setup_agents_md)
 
+    # setup-gemini-mcp
+    s = sub.add_parser("setup-gemini-mcp", help="Install Kindex MCP server into Gemini CLI")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed MCP server")
+    _common(s)
+    s.set_defaults(func=cmd_setup_gemini_mcp)
+
+    # setup-gemini-md
+    s = sub.add_parser("setup-gemini-md",
+                       help="Output recommended GEMINI.md kindex directives")
+    s.add_argument("--install", action="store_true",
+                   help="Append to ~/.gemini/GEMINI.md (if not already present)")
+    _common(s)
+    s.set_defaults(func=cmd_setup_gemini_md)
+
+    # setup-antigravity-mcp
+    s = sub.add_parser("setup-antigravity-mcp",
+                       help="Install Kindex MCP server into Google Antigravity")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed MCP server")
+    _common(s)
+    s.set_defaults(func=cmd_setup_antigravity_mcp)
+
+    # setup-antigravity-hooks
+    s = sub.add_parser("setup-antigravity-hooks",
+                       help="Install Kindex lifecycle hooks into Google Antigravity")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed hooks")
+    _common(s)
+    s.set_defaults(func=cmd_setup_antigravity_hooks)
+
+    # setup-antigravity-md
+    s = sub.add_parser("setup-antigravity-md",
+                       help="Output recommended Antigravity/GEMINI.md kindex directives")
+    s.add_argument("--install", action="store_true",
+                   help="Append to ~/.gemini/GEMINI.md (if not already present)")
+    _common(s)
+    s.set_defaults(func=cmd_setup_antigravity_md)
+
+    # setup-opencode-mcp
+    s = sub.add_parser("setup-opencode-mcp", help="Install Kindex MCP server into OpenCode")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed MCP server")
+    _common(s)
+    s.set_defaults(func=cmd_setup_opencode_mcp)
+
+    # setup-cursor-mcp
+    s = sub.add_parser("setup-cursor-mcp", help="Install Kindex MCP server into Cursor")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove installed MCP server")
+    _common(s)
+    s.set_defaults(func=cmd_setup_cursor_mcp)
+
+    # setup-cursor-rules
+    s = sub.add_parser("setup-cursor-rules",
+                       help="Output recommended Cursor rule (.mdc) for kindex")
+    s.add_argument("--install", action="store_true",
+                   help="Write ~/.cursor/rules/kindex.mdc (if not already present)")
+    _common(s)
+    s.set_defaults(func=cmd_setup_cursor_rules)
+
     # config
     s = sub.add_parser("config", help="View or edit configuration")
     s.add_argument("config_action", nargs="?", default="show",
@@ -3990,6 +6220,59 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write to global config (~/.config/kindex/kin.yaml)")
     _common(s)
     s.set_defaults(func=cmd_config)
+
+    # agent-config
+    s = sub.add_parser("agent-config",
+                       help="Show/set per-agent Kindex behavior overrides")
+    s.add_argument("agent_config_action", nargs="?", default="show",
+                   choices=["show", "set"],
+                   help="Action: show or set")
+    s.add_argument("key", nargs="?", help="Setting key for set")
+    s.add_argument("value", nargs="?", help="Setting value for set")
+    s.add_argument("--client", help="Client family: claude, codex, antigravity, etc.")
+    s.add_argument("--instance", help="Instance/conversation key for instance scope")
+    s.add_argument("--scope", choices=["client", "instance"], default="client",
+                   help="Write scope for set (default: client)")
+    s.add_argument("--global", dest="global_", action="store_true",
+                   help="Write to global config (~/.config/kindex/kin.yaml)")
+    _common(s)
+    s.set_defaults(func=cmd_agent_config)
+
+    # attention
+    s = sub.add_parser("attention", help="Conversation-attention runtime controls")
+    s.add_argument("attention_action", nargs="?", default="status",
+                   choices=["status", "on", "off", "inherit", "check", "drain", "budget", "estimate", "reinforce"],
+                   help="Action: status, on, off, inherit, check, drain, budget, estimate, reinforce")
+    s.add_argument("--conversation-id", help="Conversation/session id for per-conversation state")
+    s.add_argument("--text", help="Conversation snippet for manual check")
+    s.add_argument("--force", action="store_true", help="Run check regardless of tick interval")
+    s.add_argument("--enqueue", action="store_true",
+                   help="Silently queue this session for later reinforcement (Stop/PreCompact hook)")
+    s.add_argument("--messages", type=int, default=100,
+                   help="Message-window size for attention estimate")
+    _common(s)
+    s.set_defaults(func=cmd_attention)
+
+    # sim — optional Jeremy-simulacrum supervisory check-in
+    s = sub.add_parser("sim", help="Sim supervisory check-in runtime controls")
+    s.add_argument("sim_action", nargs="?", default="status",
+                   choices=["status", "on", "off", "enable", "disable", "inherit",
+                            "check", "drain", "guidance"],
+                   help="Action: status, on/off (kill switch), inherit, check, drain, guidance")
+    s.add_argument("--text", help="Window for `check`, or guidance text for `guidance`")
+    s.add_argument("--clear", action="store_true", help="With `guidance`: clear it")
+    _common(s)
+    s.set_defaults(func=cmd_sim)
+
+    # policy
+    s = sub.add_parser("policy", help="Show/check project work policy from .kin config")
+    s.add_argument("policy_action", nargs="?", choices=["show", "check"], default="show",
+                   help="Action: show or check")
+    s.add_argument("--event", choices=["manual", "agent-start", "pre-commit", "pre-push", "pre-deploy"],
+                   default="manual", help="Event being checked")
+    s.add_argument("--strict", action="store_true", help="Exit non-zero on policy violations")
+    _common(s)
+    s.set_defaults(func=cmd_policy)
 
     # skills
     s = sub.add_parser("skills", help="Show skill profile for a person")
@@ -4020,8 +6303,31 @@ def build_parser() -> argparse.ArgumentParser:
     # index
     s = sub.add_parser("index", help="Write .kin/index.json for git tracking")
     s.add_argument("--output-dir", type=str, help="Output directory (default: current dir)")
+    s.add_argument("--no-merge-driver", action="store_true",
+                   help="Skip auto-registering the .kin structured merge driver")
     _common(s)
     s.set_defaults(func=cmd_index)
+
+    # merge-kin (git merge driver for .kin artifacts)
+    s = sub.add_parser(
+        "merge-kin",
+        help="Git merge driver for .kin artifacts (structured union; called by git)",
+    )
+    s.add_argument("base", help="Ancestor/base version (git %%O)")
+    s.add_argument("ours", help="Current/ours version + output target (git %%A)")
+    s.add_argument("theirs", help="Other/theirs version (git %%B)")
+    s.add_argument("path", help="In-repo pathname (git %%P)")
+    s.set_defaults(func=cmd_merge_kin)
+
+    # setup-merge (install the merge driver into the current repo)
+    s = sub.add_parser(
+        "setup-merge",
+        help="Install the .kin structured merge driver into the current git repo",
+    )
+    s.add_argument("--project-path", help="Repo path (default: current directory)")
+    s.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    s.add_argument("--uninstall", action="store_true", help="Remove the merge driver")
+    s.set_defaults(func=cmd_setup_merge)
 
     # sync-links
     s = sub.add_parser("sync-links", help="Update node content with connection references")
@@ -4044,6 +6350,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Include LLM-powered cluster consolidation")
     s.add_argument("--detach", action="store_true",
                    help="Fork detached subprocess and return immediately")
+    s.add_argument("--force", action="store_true",
+                   help="With --detach, bypass the scheduled dream throttle")
     _common(s)
     s.set_defaults(func=cmd_dream)
 
@@ -4087,7 +6395,8 @@ def build_parser() -> argparse.ArgumentParser:
     # task
     s = sub.add_parser("task", help="Graph-connected task management")
     s.add_argument("task_action", nargs="?", default="list",
-                   choices=["add", "list", "show", "done", "cancel", "update", "nearby"])
+                   choices=["add", "list", "show", "claim", "release", "cleanup",
+                            "done", "cancel", "update", "nearby"])
     s.add_argument("title_words", nargs="*", help="Task title (for add)")
     s.add_argument("--priority", type=int, choices=[1, 2, 3, 4, 5], default=3,
                    help="Priority: 1=urgent 2=high 3=normal 4=low 5=someday")
@@ -4098,8 +6407,51 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--status", help="Filter: open, in_progress, done, all")
     s.add_argument("--effort", choices=["small", "medium", "large"])
     s.add_argument("--domain", help="Filter by domain")
+    s.add_argument("--agent", help="Agent name for claim/release")
+    s.add_argument("--ttl", type=int, default=120, help="Claim TTL in minutes")
+    s.add_argument("--note", help="Claim note")
+    s.add_argument("--force", action="store_true", help="Force claim/release takeover")
     _common(s)
     s.set_defaults(func=cmd_task)
+
+    # coord
+    s = sub.add_parser("coord", help="Short-lived agent coordination conversations")
+    s.add_argument("coord_action", nargs="?", default="list",
+                   choices=["start", "post", "read", "list", "end", "cleanup",
+                            "join", "attach", "inject"])
+    s.add_argument("name", nargs="?", help="Conversation name or id")
+    s.add_argument("message_words", nargs="*",
+                   help="Message body (post), node id (attach), or "
+                        "set/clear/list + text (inject)")
+    s.add_argument("--agent", help="Agent name (default: resolved agent id)")
+    s.add_argument("--task-id", help="Related task id")
+    s.add_argument("--ttl", type=int, default=240, help="Conversation TTL in minutes")
+    s.add_argument("--since-id", type=int, default=0, help="Read messages after id")
+    s.add_argument("--limit", type=int, default=50, help="Read/list limit")
+    s.add_argument("--status", default="active", help="Filter: active, ended, all")
+    s.add_argument("--project", action="store_true", help="Filter by current project")
+    s.add_argument("--summary", help="End summary retained after clearing messages")
+    s.add_argument("--to", help="Target agent (post / inject set)")
+    s.add_argument("--id", type=int, help="Inject message id (inject clear)")
+    _common(s)
+    s.set_defaults(func=cmd_coord)
+
+    # lock / unlock
+    s = sub.add_parser("lock", help="Acquire an advisory lock on a node")
+    s.add_argument("node_id", help="Node ID or title")
+    s.add_argument("--ttl", type=int, default=60, help="Lock TTL in minutes")
+    s.add_argument("--note", default="", help="Why the node is locked")
+    s.add_argument("--agent", help="Agent name (default: resolved agent id)")
+    s.add_argument("--force", action="store_true", help="Take over a foreign lock")
+    _common(s)
+    s.set_defaults(func=cmd_lock)
+
+    s = sub.add_parser("unlock", help="Release an advisory lock on a node")
+    s.add_argument("node_id", help="Node ID or title")
+    s.add_argument("--agent", help="Agent name (default: resolved agent id)")
+    s.add_argument("--force", action="store_true", help="Clear a foreign lock")
+    _common(s)
+    s.set_defaults(func=cmd_unlock)
 
     # remind
     s = sub.add_parser("remind", help="Reminder management (create, list, snooze, done, cancel, check)")
@@ -4117,8 +6469,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--instructions", dest="action_instructions",
                    help="NL instructions for Claude (triggers claude -p mode)")
     s.add_argument("--action-mode", dest="action_mode",
-                   choices=["shell", "claude", "auto"], default="auto",
+                   choices=["shell", "claude", "codex", "opencode", "auto"], default="auto",
                    help="Execution mode (default: auto)")
+    s.add_argument("--wake", dest="wake_client", choices=["codex", "opencode"],
+                   help="Wake a headless agent when due")
+    s.add_argument("--wake-session", "--session", dest="wake_session_id",
+                   help="Host session id to resume for --wake; use 'last' for latest")
+    s.add_argument("--wake-cwd", "--cwd", dest="wake_cwd",
+                   help="Working directory for the wake run")
+    s.add_argument("--wake-model", dest="wake_model",
+                   help="Model override for the wake run")
+    s.add_argument("--wake-agent", dest="wake_agent",
+                   help="OpenCode agent override for the wake run")
+    s.add_argument("--attention-trigger",
+                   help="Comma-separated conversation trigger terms for attention injection")
+    s.add_argument("--conversation-id", help="Scope reminder to this conversation/session id")
+    s.add_argument("--scope", dest="reminder_scope", choices=["chat", "global"],
+                   help="Visibility scope for hook injection")
+    s.add_argument("--all-profiles", dest="all_profiles", action="store_true",
+                   help="Check reminders across all configured profiles (for check)")
     _common(s)
     s.set_defaults(func=cmd_remind)
 
@@ -4136,6 +6505,27 @@ def build_parser() -> argparse.ArgumentParser:
     _common(s)
     s.set_defaults(func=cmd_mode)
 
+    # agent-prime-hook (portable one-shot prime hook)
+    s = sub.add_parser("agent-prime-hook", help="Portable one-shot agent prime hook")
+    s.add_argument("--adapter", default="plain",
+                   choices=["plain", "claude", "codex", "antigravity"])
+    s.add_argument("--client", help="Client family for config overrides")
+    s.add_argument("--event", default="PreInvocation", help="Hook event name")
+    s.add_argument("--tokens", type=int, default=750)
+    s.add_argument("--topic")
+    s.add_argument("--conversation-id")
+    s.add_argument("--agent-instance")
+    _common(s)
+    s.set_defaults(func=cmd_agent_prime_hook)
+
+    # agent-stop-hook (portable session-end hook)
+    s = sub.add_parser("agent-stop-hook", help="Portable session-end hook")
+    s.add_argument("--adapter", default="plain",
+                   choices=["plain", "claude", "codex", "antigravity"])
+    s.add_argument("--conversation-id")
+    _common(s)
+    s.set_defaults(func=cmd_agent_stop_hook)
+
     # stop-guard (Claude Code Stop hook)
     s = sub.add_parser("stop-guard", help="Stop hook guard for actionable reminders")
     _common(s)
@@ -4143,13 +6533,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     # prompt-check (Claude Code UserPromptSubmit hook)
     s = sub.add_parser("prompt-check", help="Check for due reminders on prompt submit")
+    s.add_argument("--text", help="Conversation snippet (normally read from hook stdin)")
+    s.add_argument("--conversation-id", help="Conversation/session id for attention budgets")
+    s.add_argument("--force-attention", action="store_true",
+                   help="Run attention regardless of tick interval")
+    s.add_argument("--adapter", default="plain",
+                   choices=["plain", "claude", "codex", "antigravity"],
+                   help="Render hook output for a client protocol")
+    s.add_argument("--agent-instance", help="Agent instance/conversation override key")
     _common(s)
     s.set_defaults(func=cmd_prompt_check)
+
+    # attention-hook (advisory tool/action hook)
+    s = sub.add_parser("attention-hook", help="Advisory attention hook for tool/action events")
+    s.add_argument("--adapter", default="claude",
+                   choices=["plain", "claude", "codex", "antigravity"],
+                   help="Render hook output for a client protocol")
+    s.add_argument("--event", help="Hook event name (default from stdin, then PreToolUse)")
+    s.add_argument("--text", help="Conversation/action snippet (normally read from hook stdin)")
+    s.add_argument("--conversation-id", help="Conversation/session id for attention budgets")
+    s.add_argument("--agent-instance", help="Agent instance/conversation override key")
+    s.add_argument("--force", action="store_true", help="Run attention regardless of tick interval")
+    s.add_argument("--deadline-ms", type=int, default=3500,
+                   help="Internal hook deadline; return empty if no result arrives in time")
+    _common(s)
+    s.set_defaults(func=cmd_attention_hook)
 
     return p
 
 
 def main():
+    from .store import ProfileMismatchError
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -4162,7 +6577,13 @@ def main():
         return
 
     if hasattr(args, "func"):
-        args.func(args)
+        try:
+            args.func(args)
+        except ProfileMismatchError as e:
+            # Sequestration guard: never open a DB stamped for another
+            # profile — fail clearly instead of dumping a traceback.
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
     else:
         parser.print_help()
 

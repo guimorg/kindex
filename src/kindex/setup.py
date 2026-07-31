@@ -2,12 +2,60 @@
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from xml.sax.saxutils import escape
 
 if TYPE_CHECKING:
     from .config import Config
+
+
+def _kin_command_parts(kin_path: str) -> list[str]:
+    """Split the fallback python -m invocation while preserving normal kin paths."""
+    if " -m kindex.cli" in kin_path:
+        return shlex.split(kin_path)
+    return [kin_path]
+
+
+def _kin_hook_command(kin_path: str, args: list[str]) -> str:
+    """Build a hook command that loads shell exports before running kin."""
+    command = " ".join(shlex.quote(part) for part in [*_kin_command_parts(kin_path), *args])
+    script = f"source ~/.profile >/dev/null 2>&1 || true; exec {command}"
+    return f"/bin/bash -lc {shlex.quote(script)}"
+
+
+def _kin_stop_hook_command(kin_path: str, args: list[str]) -> str:
+    """Build a Claude Stop hook command that avoids stop-hook recursion."""
+    command = " ".join(shlex.quote(part) for part in [*_kin_command_parts(kin_path), *args])
+    active_check = (
+        "import json,sys; "
+        "raw=sys.stdin.read(); "
+        "\ntry:\n data=json.loads(raw or '{}') if raw.strip() else {}\n"
+        "except Exception:\n data={}\n"
+        "sys.exit(0 if data.get('stop_hook_active') else 1)"
+    )
+    script = (
+        "payload=$(cat); "
+        f"if printf '%s' \"$payload\" | python3 -c {shlex.quote(active_check)}; "
+        "then exit 0; fi; "
+        "source ~/.profile >/dev/null 2>&1 || true; "
+        f"printf '%s' \"$payload\" | {command}"
+    )
+    return f"/bin/bash -lc {shlex.quote(script)}"
+
+
+def _hook_needs_profile(entry: object) -> bool:
+    return "source ~/.profile" not in str(entry)
+
+
+def _hook_needs_stop_active_guard(entry: object) -> bool:
+    return "stop_hook_active" not in str(entry)
+
+
+def _hook_needs_attention_deadline(entry: object) -> bool:
+    return "--deadline-ms" not in str(entry)
 
 
 def install_claude_hooks(config: "Config", dry_run: bool = False) -> list[str]:
@@ -39,14 +87,22 @@ def install_claude_hooks(config: "Config", dry_run: bool = False) -> list[str]:
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": f"{kin_path} prime --for hook",
+            "command": _kin_hook_command(kin_path, ["prime", "--for", "hook"]),
             "timeout": 5000
         }]
     }
     # Check if already installed
-    if not any("kin prime" in str(h) or "kindex" in str(h).lower() for h in session_start):
+    existing_idx = next(
+        (i for i, h in enumerate(session_start)
+         if "kin prime" in str(h) or "kindex" in str(h).lower()),
+        None,
+    )
+    if existing_idx is None:
         session_start.append(kindex_hook)
         actions.append("Added SessionStart hook: kin prime --for hook")
+    elif _hook_needs_profile(session_start[existing_idx]):
+        session_start[existing_idx] = kindex_hook
+        actions.append("Updated SessionStart hook to source ~/.profile")
     else:
         actions.append("SessionStart hook already installed")
 
@@ -56,13 +112,17 @@ def install_claude_hooks(config: "Config", dry_run: bool = False) -> list[str]:
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": f"{kin_path} compact-hook --emit-context",
+            "command": _kin_hook_command(kin_path, ["compact-hook", "--emit-context"]),
             "timeout": 10000
         }]
     }
-    if not any("compact-hook" in str(h) for h in pre_compact):
+    existing_idx = next((i for i, h in enumerate(pre_compact) if "compact-hook" in str(h)), None)
+    if existing_idx is None:
         pre_compact.append(compact_hook)
         actions.append("Added PreCompact hook: kin compact-hook --emit-context")
+    elif _hook_needs_profile(pre_compact[existing_idx]):
+        pre_compact[existing_idx] = compact_hook
+        actions.append("Updated PreCompact hook to source ~/.profile")
     else:
         actions.append("PreCompact hook already installed")
 
@@ -72,55 +132,113 @@ def install_claude_hooks(config: "Config", dry_run: bool = False) -> list[str]:
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": f"{kin_path} prompt-check",
+            "command": _kin_hook_command(kin_path, ["prompt-check"]),
             "timeout": 2000
         }]
     }
-    if not any("prompt-check" in str(h) for h in prompt_submit):
+    existing_idx = next((i for i, h in enumerate(prompt_submit) if "prompt-check" in str(h)), None)
+    if existing_idx is None:
         prompt_submit.append(prompt_hook)
         actions.append("Added UserPromptSubmit hook: kin prompt-check")
+    elif _hook_needs_profile(prompt_submit[existing_idx]):
+        prompt_submit[existing_idx] = prompt_hook
+        actions.append("Updated UserPromptSubmit hook to source ~/.profile")
     else:
         actions.append("UserPromptSubmit hook already installed")
 
-    # Stop hook — guard for actionable reminders + session capture + dream
+    # PreToolUse hook — advisory attention near actions, modeled after signet-eval INJECT.
+    pre_tool = hooks.setdefault("PreToolUse", [])
+    attention_hook = {
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": _kin_hook_command(
+                kin_path,
+                ["attention-hook", "--adapter", "claude", "--event", "PreToolUse",
+                 "--deadline-ms", "3500"],
+            ),
+            "timeout": 5000,
+        }]
+    }
+    existing_idx = next((i for i, h in enumerate(pre_tool) if "attention-hook" in str(h)), None)
+    if existing_idx is None:
+        pre_tool.append(attention_hook)
+        actions.append("Added PreToolUse hook: kin attention-hook")
+    elif (
+        _hook_needs_profile(pre_tool[existing_idx])
+        or _hook_needs_attention_deadline(pre_tool[existing_idx])
+    ):
+        pre_tool[existing_idx] = attention_hook
+        actions.append("Updated PreToolUse hook with internal deadline")
+    else:
+        actions.append("PreToolUse attention hook already installed")
+
+    # Stop hook — session capture. Blocking and expensive work are opt-in because
+    # Claude surfaces blocking output and dream can consume noticeable CPU.
     stop_hooks = hooks.setdefault("Stop", [])
+    stop_hook_commands = []
+    if config.reminders.stop_guard_enabled:
+        stop_hook_commands.append({
+            "type": "command",
+            "command": _kin_stop_hook_command(kin_path, ["stop-guard"]),
+            "timeout": 5000,
+        })
+    stop_hook_commands.extend([
+        {
+            "type": "command",
+            "command": _kin_stop_hook_command(kin_path, ["compact-hook", "--text", "Session ended"]),
+            "timeout": 5000,
+        },
+        {
+            # Super lightweight + silent: records the session for later
+            # reinforcement grading in cron (no LLM, no output on the hot path).
+            "type": "command",
+            "command": _kin_stop_hook_command(kin_path, ["attention", "reinforce", "--enqueue"]),
+            "timeout": 3000,
+        },
+    ])
+    if config.reminders.dream_on_stop_enabled:
+        stop_hook_commands.append({
+            "type": "command",
+            "command": _kin_stop_hook_command(kin_path, ["dream", "--detach", "--lightweight"]),
+            "timeout": 3000,
+        })
     stop_guard_entry = {
         "matcher": "",
-        "hooks": [
-            {
-                "type": "command",
-                "command": f"{kin_path} stop-guard",
-                "timeout": 5000,
-            },
-            {
-                "type": "command",
-                "command": f'{kin_path} compact-hook --text "Session ended"',
-                "timeout": 5000,
-            },
-            {
-                "type": "command",
-                "command": f"{kin_path} dream --detach --lightweight",
-                "timeout": 3000,
-            },
-        ]
+        "hooks": stop_hook_commands,
     }
-    if not any("stop-guard" in str(h) for h in stop_hooks):
-        hooks["Stop"] = [stop_guard_entry]
-        actions.append("Added Stop hook: kin stop-guard + compact-hook + dream")
-    elif not any("dream" in str(h) for h in stop_hooks):
-        # Existing stop-guard but no dream — add dream to existing entry
-        for entry in stop_hooks:
-            if isinstance(entry, dict) and "hooks" in entry:
-                hook_list = entry["hooks"]
-                if not any("dream" in str(h) for h in hook_list):
-                    hook_list.append({
-                        "type": "command",
-                        "command": f"{kin_path} dream --detach --lightweight",
-                        "timeout": 3000,
-                    })
-        actions.append("Added dream --detach to existing Stop hook")
+    existing_idx = next(
+        (i for i, h in enumerate(stop_hooks)
+         if "stop-guard" in str(h) or "compact-hook" in str(h) or "dream" in str(h)
+         or "reinforce" in str(h)),
+        None,
+    )
+    if existing_idx is None:
+        stop_hooks.append(stop_guard_entry)
+        if config.reminders.stop_guard_enabled:
+            action = "Added Stop hook: kin stop-guard + compact-hook"
+        else:
+            action = "Added Stop hook: kin compact-hook"
+        if config.reminders.dream_on_stop_enabled:
+            action += " + dream"
+        actions.append(action)
+    elif (
+        _hook_needs_profile(stop_hooks[existing_idx])
+        or _hook_needs_stop_active_guard(stop_hooks[existing_idx])
+        or ("dream" in str(stop_hooks[existing_idx]) and not config.reminders.dream_on_stop_enabled)
+        or ("dream" not in str(stop_hooks[existing_idx]) and config.reminders.dream_on_stop_enabled)
+        or ("stop-guard" in str(stop_hooks[existing_idx]) and not config.reminders.stop_guard_enabled)
+        or ("stop-guard" not in str(stop_hooks[existing_idx]) and config.reminders.stop_guard_enabled)
+    ):
+        stop_hooks[existing_idx] = stop_guard_entry
+        action = "Updated Stop hook to source ~/.profile and avoid recursion"
+        if config.reminders.stop_guard_enabled:
+            action += " with guard"
+        if config.reminders.dream_on_stop_enabled:
+            action += " with dream"
+        actions.append(action)
     else:
-        actions.append("Stop hook already installed (with dream)")
+        actions.append("Stop hook already installed")
 
     if not dry_run:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +246,167 @@ def install_claude_hooks(config: "Config", dry_run: bool = False) -> list[str]:
         actions.append(f"Wrote {settings_path}")
 
     return actions
+
+
+def install_codex_hooks(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex prompt-time attention hook into ~/.codex/hooks.json."""
+    hooks_path = config.codex_path / "hooks.json"
+    actions = []
+    if hooks_path.exists():
+        data = json.loads(hooks_path.read_text())
+    else:
+        data = {}
+    hooks = data.setdefault("hooks", {})
+    kin_path = _find_kin_path()
+
+    # SessionStart hook — inject the Kindex prime block (auto-primed context +
+    # the "use kindex"/.kin directive) so Codex sessions start with the same
+    # context as Claude. Codex SessionStart supports additionalContext injection
+    # (fires on startup/resume/clear); prime --adapter codex emits that envelope.
+    session_start = hooks.setdefault("SessionStart", [])
+    session_entry = {
+        "matcher": "*",
+        "hooks": [{
+            "type": "command",
+            "command": _kin_hook_command(kin_path, ["prime", "--for", "hook", "--adapter", "codex"]),
+            "timeout": 5000,
+            "statusMessage": "Loading Kindex context",
+        }]
+    }
+    existing_idx = next(
+        (i for i, h in enumerate(session_start)
+         if "kin prime" in str(h) or "kindex" in str(h).lower()),
+        None,
+    )
+    if existing_idx is None:
+        session_start.append(session_entry)
+        actions.append("Added Codex SessionStart hook: kin prime --for hook")
+    elif (
+        _hook_needs_profile(session_start[existing_idx])
+        or "--adapter" not in str(session_start[existing_idx])
+    ):
+        session_start[existing_idx] = session_entry
+        actions.append("Updated Codex SessionStart hook")
+    else:
+        actions.append("Codex SessionStart hook already installed")
+
+    prompt_submit = hooks.setdefault("UserPromptSubmit", [])
+    entry = {
+        "hooks": [{
+            "type": "command",
+            "command": _kin_hook_command(
+                kin_path,
+                ["attention-hook", "--adapter", "codex", "--event", "UserPromptSubmit",
+                 "--deadline-ms", "3500"],
+            ),
+            "timeout": 5,
+            "statusMessage": "Checking Kindex attention",
+        }]
+    }
+
+    existing_idx = next(
+        (i for i, h in enumerate(prompt_submit)
+         if "prompt-check" in str(h) or "attention-hook" in str(h)),
+        None,
+    )
+    if existing_idx is None:
+        prompt_submit.append(entry)
+        actions.append("Added Codex UserPromptSubmit hook: kin attention-hook")
+    elif (
+        _hook_needs_profile(prompt_submit[existing_idx])
+        or "prompt-check" in str(prompt_submit[existing_idx])
+        or "--adapter" not in str(prompt_submit[existing_idx])
+        or _hook_needs_attention_deadline(prompt_submit[existing_idx])
+    ):
+        prompt_submit[existing_idx] = entry
+        actions.append("Updated Codex UserPromptSubmit hook to source ~/.profile")
+    else:
+        actions.append("Codex UserPromptSubmit hook already installed")
+
+    post_tool = hooks.setdefault("PostToolUse", [])
+    post_entry = {
+        "hooks": [{
+            "type": "command",
+            "command": _kin_hook_command(
+                kin_path,
+                ["attention-hook", "--adapter", "codex", "--event", "PostToolUse",
+                 "--deadline-ms", "3500"],
+            ),
+            "timeout": 5,
+            "statusMessage": "Checking Kindex attention",
+        }]
+    }
+    existing_idx = next((i for i, h in enumerate(post_tool) if "attention-hook" in str(h)), None)
+    if existing_idx is None:
+        post_tool.append(post_entry)
+        actions.append("Added Codex PostToolUse hook: kin attention-hook")
+    elif (
+        _hook_needs_profile(post_tool[existing_idx])
+        or _hook_needs_attention_deadline(post_tool[existing_idx])
+    ):
+        post_tool[existing_idx] = post_entry
+        actions.append("Updated Codex PostToolUse hook with internal deadline")
+    else:
+        actions.append("Codex PostToolUse attention hook already installed")
+
+    if dry_run:
+        actions.append(f"Would write {hooks_path}")
+        return actions
+
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(json.dumps(data, indent=2) + "\n")
+    actions.append(f"Wrote {hooks_path}")
+    return actions
+
+
+def uninstall_codex_hooks(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex prompt-time attention hook from ~/.codex/hooks.json."""
+    hooks_path = config.codex_path / "hooks.json"
+    if not hooks_path.exists():
+        return ["No Codex hooks.json found"]
+
+    data = json.loads(hooks_path.read_text())
+    hooks = data.get("hooks", {})
+    prompt_submit = hooks.get("UserPromptSubmit", [])
+    post_tool = hooks.get("PostToolUse", [])
+    session_start = hooks.get("SessionStart", [])
+    kept = [
+        h for h in prompt_submit
+        if "prompt-check" not in str(h) and "attention-hook" not in str(h)
+    ]
+    kept_post = [h for h in post_tool if "attention-hook" not in str(h)]
+    kept_session = [
+        h for h in session_start
+        if "kin prime" not in str(h) and "kindex" not in str(h).lower()
+    ]
+    if (
+        len(kept) == len(prompt_submit)
+        and len(kept_post) == len(post_tool)
+        and len(kept_session) == len(session_start)
+    ):
+        return ["No Kindex Codex hooks found"]
+
+    if dry_run:
+        return [f"Would remove Codex Kindex hooks from {hooks_path}"]
+
+    if kept:
+        hooks["UserPromptSubmit"] = kept
+    else:
+        hooks.pop("UserPromptSubmit", None)
+    if kept_post:
+        hooks["PostToolUse"] = kept_post
+    else:
+        hooks.pop("PostToolUse", None)
+    if kept_session:
+        hooks["SessionStart"] = kept_session
+    else:
+        hooks.pop("SessionStart", None)
+    if hooks:
+        data["hooks"] = hooks
+    else:
+        data.pop("hooks", None)
+    hooks_path.write_text(json.dumps(data, indent=2) + "\n")
+    return [f"Removed Codex Kindex hooks from {hooks_path}"]
 
 
 def install_codex_mcp(config: "Config", dry_run: bool = False) -> list[str]:
@@ -199,6 +478,351 @@ def uninstall_codex_mcp(config: "Config", dry_run: bool = False) -> list[str]:
     return actions
 
 
+def install_gemini_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex MCP server config into ~/.gemini/settings.json."""
+    settings_path = config.gemini_path / "settings.json"
+    actions = []
+
+    if settings_path.exists():
+        data = json.loads(settings_path.read_text())
+    else:
+        data = {}
+
+    mcp_servers = data.setdefault("mcpServers", {})
+    if "kindex" in mcp_servers:
+        return ["Gemini MCP server already installed"]
+
+    mcp_servers["kindex"] = {"command": "kin-mcp", "args": []}
+
+    if dry_run:
+        actions.append(f"Would add Gemini MCP server to {settings_path}")
+        actions.append('Would configure: mcpServers.kindex = {"command":"kin-mcp","args":[]}')
+        return actions
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    actions.append("Added Gemini MCP server: kindex -> kin-mcp")
+    actions.append(f"Wrote {settings_path}")
+    return actions
+
+
+def uninstall_gemini_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex MCP config from ~/.gemini/settings.json."""
+    settings_path = config.gemini_path / "settings.json"
+
+    if not settings_path.exists():
+        return ["No Gemini settings.json found"]
+
+    data = json.loads(settings_path.read_text())
+    mcp_servers = data.get("mcpServers", {})
+
+    if "kindex" not in mcp_servers:
+        return ["No Kindex Gemini MCP server found"]
+
+    if dry_run:
+        return [f"Would remove Gemini MCP server from {settings_path}"]
+
+    del mcp_servers["kindex"]
+    if mcp_servers:
+        data["mcpServers"] = mcp_servers
+    else:
+        data.pop("mcpServers", None)
+
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    return [f"Removed Gemini MCP server from {settings_path}"]
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if path.exists():
+        content = path.read_text().strip()
+        if not content:
+            return {}
+        try:
+            data = json.loads(content)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _antigravity_mcp_paths(config: "Config") -> list[tuple[Path, str]]:
+    candidates = [
+        (config.antigravity_path / "mcp_config.json", "Antigravity editor/shared"),
+        (config.antigravity_cli_path / "mcp_config.json", "Antigravity CLI"),
+    ]
+    seen: set[Path] = set()
+    out: list[tuple[Path, str]] = []
+    for path, label in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append((path, label))
+    return out
+
+
+def install_antigravity_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex MCP config into Antigravity's standalone MCP files.
+
+    Antigravity documentation has used both ~/.gemini/config/mcp_config.json
+    and ~/.gemini/antigravity-cli/mcp_config.json for global MCP server config,
+    so Kindex writes both while preserving unrelated servers.
+    """
+    actions: list[str] = []
+    server = {"command": "kin-mcp", "args": []}
+
+    for settings_path, label in _antigravity_mcp_paths(config):
+        data = _read_json_object(settings_path)
+        mcp_servers = data.setdefault("mcpServers", {})
+        if "kindex" in mcp_servers:
+            actions.append(f"{label} MCP server already installed")
+            continue
+        mcp_servers["kindex"] = server
+        if dry_run:
+            actions.append(f"Would add Antigravity MCP server to {settings_path}")
+            continue
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n")
+        actions.append(f"Added {label} MCP server: kindex -> kin-mcp")
+        actions.append(f"Wrote {settings_path}")
+
+    return actions
+
+
+def uninstall_antigravity_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex MCP config from Antigravity MCP files."""
+    actions: list[str] = []
+    for settings_path, label in _antigravity_mcp_paths(config):
+        if not settings_path.exists():
+            actions.append(f"No {label} mcp_config.json found")
+            continue
+        data = _read_json_object(settings_path)
+        mcp_servers = data.get("mcpServers", {})
+        if "kindex" not in mcp_servers:
+            actions.append(f"No Kindex {label} MCP server found")
+            continue
+        if dry_run:
+            actions.append(f"Would remove Antigravity MCP server from {settings_path}")
+            continue
+        del mcp_servers["kindex"]
+        if mcp_servers:
+            data["mcpServers"] = mcp_servers
+        else:
+            data.pop("mcpServers", None)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n")
+        actions.append(f"Removed {label} MCP server from {settings_path}")
+    return actions
+
+
+def _antigravity_hook_config(kin_path: str) -> dict[str, Any]:
+    """Kindex hook block for Antigravity's hooks.json schema."""
+    return {
+        "enabled": True,
+        "PreInvocation": [
+            {
+                "type": "command",
+                "command": _kin_hook_command(
+                    kin_path,
+                    ["agent-prime-hook", "--adapter", "antigravity", "--client", "antigravity"],
+                ),
+                "timeout": 5,
+            },
+            {
+                "type": "command",
+                "command": _kin_hook_command(
+                    kin_path,
+                    ["prompt-check", "--adapter", "antigravity"],
+                ),
+                "timeout": 5,
+            },
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "*",
+                "hooks": [{
+                    "type": "command",
+                    "command": _kin_hook_command(
+                        kin_path,
+                        [
+                            "attention-hook",
+                            "--adapter",
+                            "antigravity",
+                            "--event",
+                            "PreToolUse",
+                            "--deadline-ms",
+                            "3500",
+                        ],
+                    ),
+                    "timeout": 5,
+                }],
+            },
+        ],
+        "Stop": [
+            {
+                "type": "command",
+                "command": _kin_hook_command(
+                    kin_path,
+                    ["agent-stop-hook", "--adapter", "antigravity"],
+                ),
+                "timeout": 5,
+            },
+        ],
+    }
+
+
+def install_antigravity_hooks(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex lifecycle hooks into Antigravity hooks.json."""
+    hooks_path = config.antigravity_path / "hooks.json"
+    data = _read_json_object(hooks_path)
+    hook_config = _antigravity_hook_config(_find_kin_path())
+    existing = data.get("kindex")
+
+    if existing == hook_config:
+        return ["Antigravity Kindex hooks already installed"]
+
+    action = "Updated Antigravity Kindex hooks" if existing else "Added Antigravity Kindex hooks"
+    data["kindex"] = hook_config
+    actions = [action]
+
+    if dry_run:
+        actions.append(f"Would write {hooks_path}")
+        return actions
+
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.write_text(json.dumps(data, indent=2) + "\n")
+    actions.append(f"Wrote {hooks_path}")
+    return actions
+
+
+def uninstall_antigravity_hooks(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex's Antigravity hook block."""
+    hooks_path = config.antigravity_path / "hooks.json"
+    if not hooks_path.exists():
+        return ["No Antigravity hooks.json found"]
+    data = _read_json_object(hooks_path)
+    if "kindex" not in data:
+        return ["No Kindex Antigravity hooks found"]
+    if dry_run:
+        return [f"Would remove Antigravity Kindex hooks from {hooks_path}"]
+    data.pop("kindex", None)
+    hooks_path.write_text(json.dumps(data, indent=2) + "\n")
+    return [f"Removed Antigravity Kindex hooks from {hooks_path}"]
+
+
+def install_opencode_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex MCP server config into ~/.config/opencode/opencode.json."""
+    settings_path = config.opencode_path / "opencode.json"
+    actions = []
+
+    if settings_path.exists():
+        data = json.loads(settings_path.read_text())
+    else:
+        data = {"$schema": "https://opencode.ai/config.json"}
+
+    mcp = data.setdefault("mcp", {})
+    if "kindex" in mcp:
+        return ["OpenCode MCP server already installed"]
+
+    mcp["kindex"] = {
+        "type": "local",
+        "command": ["kin-mcp"],
+        "enabled": True,
+    }
+
+    if dry_run:
+        actions.append(f"Would add OpenCode MCP server to {settings_path}")
+        actions.append('Would configure: mcp.kindex = {"type":"local","command":["kin-mcp"],"enabled":true}')
+        return actions
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    actions.append("Added OpenCode MCP server: kindex -> kin-mcp")
+    actions.append(f"Wrote {settings_path}")
+    return actions
+
+
+def uninstall_opencode_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex MCP config from ~/.config/opencode/opencode.json."""
+    settings_path = config.opencode_path / "opencode.json"
+
+    if not settings_path.exists():
+        return ["No OpenCode opencode.json found"]
+
+    data = json.loads(settings_path.read_text())
+    mcp = data.get("mcp", {})
+
+    if "kindex" not in mcp:
+        return ["No Kindex OpenCode MCP server found"]
+
+    if dry_run:
+        return [f"Would remove OpenCode MCP server from {settings_path}"]
+
+    del mcp["kindex"]
+    if mcp:
+        data["mcp"] = mcp
+    else:
+        data.pop("mcp", None)
+
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    return [f"Removed OpenCode MCP server from {settings_path}"]
+
+
+def install_cursor_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Install Kindex MCP server config into ~/.cursor/mcp.json."""
+    settings_path = config.cursor_path / "mcp.json"
+    actions = []
+
+    if settings_path.exists():
+        data = json.loads(settings_path.read_text())
+    else:
+        data = {}
+
+    mcp_servers = data.setdefault("mcpServers", {})
+    if "kindex" in mcp_servers:
+        return ["Cursor MCP server already installed"]
+
+    mcp_servers["kindex"] = {
+        "type": "stdio",
+        "command": "kin-mcp",
+    }
+
+    if dry_run:
+        actions.append(f"Would add Cursor MCP server to {settings_path}")
+        actions.append('Would configure: mcpServers.kindex = {"type":"stdio","command":"kin-mcp"}')
+        return actions
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    actions.append("Added Cursor MCP server: kindex -> kin-mcp")
+    actions.append(f"Wrote {settings_path}")
+    return actions
+
+
+def uninstall_cursor_mcp(config: "Config", dry_run: bool = False) -> list[str]:
+    """Remove Kindex MCP config from ~/.cursor/mcp.json."""
+    settings_path = config.cursor_path / "mcp.json"
+
+    if not settings_path.exists():
+        return ["No Cursor mcp.json found"]
+
+    data = json.loads(settings_path.read_text())
+    mcp_servers = data.get("mcpServers", {})
+
+    if "kindex" not in mcp_servers:
+        return ["No Kindex Cursor MCP server found"]
+
+    if dry_run:
+        return [f"Would remove Cursor MCP server from {settings_path}"]
+
+    del mcp_servers["kindex"]
+    if mcp_servers:
+        data["mcpServers"] = mcp_servers
+    else:
+        data.pop("mcpServers", None)
+
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    return [f"Removed Cursor MCP server from {settings_path}"]
+
+
 def install_launchd(config: "Config", dry_run: bool = False) -> list[str]:
     """Install macOS launchd plist for kin cron.
 
@@ -209,45 +833,75 @@ def install_launchd(config: "Config", dry_run: bool = False) -> list[str]:
     kin_path = _find_kin_path()
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / "com.kindex.cron.plist"
-    log_dir = config.data_path / "logs"
+    log_dir = config.scheduler_log_path
     interval = config.reminders.check_interval
 
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.kindex.cron</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{kin_path}</string>
-        <string>cron</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>{interval}</integer>
-    <key>StandardOutPath</key>
-    <string>{log_dir}/cron.log</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/cron-error.log</string>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"""
+    plist_content = _launchd_plist(
+        label="com.kindex.cron",
+        program_args=[*_kin_command_parts(kin_path), "cron"],
+        interval=interval,
+        stdout_path=f"{log_dir}/cron.log",
+        stderr_path=f"{log_dir}/cron-error.log",
+    )
 
     if not dry_run:
         launch_agents.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(plist_content)
-        # Load the plist
-        subprocess.run(["launchctl", "load", str(plist_path)],
-                       capture_output=True, timeout=5)
+        _launchctl_reload(plist_path)
         actions.append(f"Installed launchd plist: {plist_path}")
         actions.append("Loaded with launchctl")
     else:
         actions.append(f"Would install: {plist_path}")
 
     return actions
+
+
+def _launchctl_reload(plist_path: Path) -> None:
+    """Unload (ignoring 'not loaded' errors) then load a plist.
+
+    A bare ``load`` on an already-loaded label is a no-op error and launchd
+    keeps the OLD job definition — an upgraded argv or interval would silently
+    never take effect until logout.
+    """
+    subprocess.run(["launchctl", "unload", str(plist_path)],
+                   capture_output=True, timeout=5)
+    subprocess.run(["launchctl", "load", str(plist_path)],
+                   capture_output=True, timeout=5)
+
+
+def _launchd_plist(*, label: str, program_args: list[str], interval: int,
+                   stdout_path: str, stderr_path: str) -> str:
+    """Render a launchd plist for a periodic kin job.
+
+    ``program_args`` is emitted one <string> per argv element so the
+    ``python -m kindex.cli`` fallback path stays a valid command instead of
+    collapsing into a single unrunnable string.
+    """
+    arg_lines = "\n".join(
+        f"        <string>{escape(part)}</string>" for part in program_args
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{escape(label)}</string>
+    <key>ProgramArguments</key>
+    <array>
+{arg_lines}
+    </array>
+    <key>StartInterval</key>
+    <integer>{int(interval)}</integer>
+    <key>StandardOutPath</key>
+    <string>{escape(stdout_path)}</string>
+    <key>StandardErrorPath</key>
+    <string>{escape(stderr_path)}</string>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"""
 
 
 def reload_launchd() -> bool:
@@ -281,83 +935,157 @@ def uninstall_launchd(dry_run: bool = False) -> list[str]:
     return actions
 
 
+def is_kindex_cron_line(line: str) -> bool:
+    """Shape-match every historical kindex crontab job line.
+
+    Shared by install (migration), uninstall, and the adaptive repack so
+    the matchers never diverge. Matches command shapes only — never
+    comments or user lines that merely mention a kindex path (e.g. a
+    backup job touching ~/.kindex must not be classified as ours).
+    Covers the binary form ("kin cron"), the `python -m kindex.cli`
+    fallback ("kindex.cli cron"), and the reminder job.
+    """
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
+        return False
+    return ("kin cron" in stripped or "kindex.cli cron" in stripped
+            or "kindex cron" in stripped
+            or "remind check --all-profiles" in stripped)
+
+
 def install_crontab(config: "Config", dry_run: bool = False) -> list[str]:
-    """Install crontab entry for kin cron (for Linux/non-macOS)."""
+    """Install crontab entries for kin maintenance (for Linux/non-macOS).
+
+    Two entries: the full maintenance cycle, plus a dedicated frequent
+    ``kin remind check --all-profiles`` so reminder delivery never waits
+    behind a slow or stalled maintenance run.
+
+    Re-running migrates stale entries in place (e.g. a log path frozen
+    from a previously active profile) instead of reporting them as
+    already installed. A line counts as current when its command and log
+    redirect match; the schedule field is ignored so an adaptively
+    repacked interval (scheduling._apply_crontab) survives re-runs.
+    """
     actions = []
     kin_path = _find_kin_path()
-    log_path = config.data_path / "logs" / "cron.log"
+    log_dir = config.scheduler_log_path
 
-    cron_line = f"*/30 * * * * {kin_path} cron >> {log_path} 2>&1"
+    # Maintenance runs at :02/:32 so it is never phase-locked with the
+    # reminder checker's :00/:05/... schedule.
+    wanted = [
+        (f"{kin_path} cron >> {log_dir}/cron.log 2>&1",
+         f"2-59/30 * * * * {kin_path} cron >> {log_dir}/cron.log 2>&1"),
+        (f"remind check --all-profiles >> {log_dir}/reminders.log 2>&1",
+         f"*/5 * * * * {kin_path} remind check --all-profiles "
+         f">> {log_dir}/reminders.log 2>&1"),
+    ]
 
     # Check existing crontab
     result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = result.stdout if result.returncode == 0 else ""
+    lines = existing.splitlines()
 
-    if "kin cron" in existing or "kindex" in existing:
-        actions.append("Crontab entry already exists")
+    kept = [l for l in lines if not is_kindex_cron_line(l)]
+    pool = [l for l in lines if is_kindex_cron_line(l)]
+    had_ours = bool(pool)
+
+    final = []
+    changed = False
+    for fingerprint, default_line in wanted:
+        match = next((l for l in pool if fingerprint in l), None)
+        if match is not None:
+            # Current command + log target: keep as-is (preserves an
+            # adaptively repacked schedule).
+            pool.remove(match)
+            final.append(match)
+        else:
+            final.append(default_line)
+            changed = True
+    if pool:
+        # Leftover kindex job lines are stale (old log path) or dupes —
+        # dropping them is the migration.
+        changed = True
+
+    if not changed:
+        actions.append("Crontab entries already exist")
         return actions
 
+    verb, dry_verb = ("Replaced", "replace") if had_ours else ("Added", "add")
     if not dry_run:
-        new_crontab = existing.rstrip() + "\n" + cron_line + "\n"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            actions.append(f"Failed to create log dir {log_dir}: {e}")
+            return actions
+        new_crontab = "\n".join([*kept, *final]) + "\n"
         proc = subprocess.run(["crontab", "-"], input=new_crontab,
                               capture_output=True, text=True)
         if proc.returncode == 0:
-            actions.append(f"Added crontab: {cron_line}")
+            for line in final:
+                actions.append(f"{verb} crontab: {line}")
         else:
             actions.append(f"Failed to add crontab: {proc.stderr}")
     else:
-        actions.append(f"Would add crontab: {cron_line}")
+        for line in final:
+            actions.append(f"Would {dry_verb} crontab: {line}")
 
     return actions
 
 
 def install_reminder_daemon(config: "Config", dry_run: bool = False) -> list[str]:
-    """Install macOS launchd plist for reminder checks (every 5 min).
+    """Install macOS launchd plist for reminder checks.
 
-    Creates ~/Library/LaunchAgents/com.kindex.reminders.plist
-    Separate from the main cron plist to keep heavy ingestion at 30 min.
+    Creates ~/Library/LaunchAgents/com.kindex.reminders.plist. Separate from
+    the main cron plist so reminder delivery never waits behind heavy
+    maintenance (ingest/LLM/embedding): even if a ``kin cron`` run stalls or
+    overruns its interval, this job keeps firing due reminders directly.
+    ``--all-profiles`` sweeps every configured profile graph, not just the
+    default one. Interval is the reminder check_interval capped at 5 minutes.
     """
     actions = []
     kin_path = _find_kin_path()
     launch_agents = Path.home() / "Library" / "LaunchAgents"
     plist_path = launch_agents / "com.kindex.reminders.plist"
-    log_dir = config.data_path / "logs"
-    interval = config.reminders.check_interval
+    log_dir = config.scheduler_log_path
+    interval = min(300, max(60, int(config.reminders.check_interval or 300)))
 
-    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.kindex.reminders</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{kin_path}</string>
-        <string>remind</string>
-        <string>check</string>
-    </array>
-    <key>StartInterval</key>
-    <integer>{interval}</integer>
-    <key>StandardOutPath</key>
-    <string>{log_dir}/reminders.log</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/reminders-error.log</string>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"""
+    plist_content = _launchd_plist(
+        label="com.kindex.reminders",
+        program_args=[*_kin_command_parts(kin_path), "remind", "check",
+                      "--all-profiles"],
+        interval=interval,
+        stdout_path=f"{log_dir}/reminders.log",
+        stderr_path=f"{log_dir}/reminders-error.log",
+    )
 
     if not dry_run:
         launch_agents.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(plist_content)
-        subprocess.run(["launchctl", "load", str(plist_path)],
-                       capture_output=True, timeout=5)
+        _launchctl_reload(plist_path)
         actions.append(f"Installed reminder daemon: {plist_path}")
         actions.append(f"Check interval: {interval}s")
     else:
         actions.append(f"Would install: {plist_path}")
+
+    return actions
+
+
+def uninstall_reminder_daemon(dry_run: bool = False) -> list[str]:
+    """Remove the dedicated reminder-check launchd plist."""
+    actions = []
+    plist_path = Path.home() / "Library" / "LaunchAgents" / "com.kindex.reminders.plist"
+
+    if plist_path.exists():
+        if not dry_run:
+            subprocess.run(["launchctl", "unload", str(plist_path)],
+                           capture_output=True, timeout=5)
+            plist_path.unlink()
+            actions.append("Unloaded and removed reminder daemon plist")
+        else:
+            actions.append(f"Would remove: {plist_path}")
+    else:
+        actions.append("No reminder daemon plist found")
 
     return actions
 
@@ -370,3 +1098,122 @@ def _find_kin_path() -> str:
     # Fallback to python -m
     import sys
     return f"{sys.executable} -m kindex.cli"
+
+
+# ── .kin structured merge driver (project-level) ─────────────────────────
+
+_KIN_MERGE_ATTRS = (
+    ".kin/index.json merge=kindex",
+    ".kin/code-map.json merge=kindex",
+)
+_KIN_MERGE_ATTR_HEADER = "# Kindex generated artifacts: structured union merge"
+
+
+def git_repo_root(start: "str | Path | None" = None) -> "Path | None":
+    """Repo top-level for ``start`` (cwd by default), or None if not a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(start or Path.cwd()),
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip())
+
+
+def merge_driver_registered(root: "Path") -> bool:
+    """True when this clone is FULLY set up for the kindex merge driver.
+
+    Requires BOTH the local .git/config driver definition (per-clone, not shared)
+    AND the .gitattributes entries that point the artifacts at it. Requiring both
+    means a half-applied install (config written but the .gitattributes write
+    failed) reports False and self-heals on the next ``kin index``; and a fresh
+    clone whose committed .gitattributes references the driver still registers the
+    missing local config.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", "merge.kindex.driver"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if not (r.returncode == 0 and r.stdout.strip()):
+        return False
+    attrs_path = root / ".gitattributes"
+    if not attrs_path.exists():
+        return False
+    have = {line.strip() for line in attrs_path.read_text().splitlines()}
+    return all(attr in have for attr in _KIN_MERGE_ATTRS)
+
+
+def install_merge_driver(root: "Path", dry_run: bool = False) -> list[str]:
+    """Register the ``kin merge-kin`` git merge driver + ``.gitattributes``.
+
+    The driver definition lives in the repo's local ``.git/config`` (not shared),
+    while ``.gitattributes`` (committed) points the ``.kin`` artifacts at it. Repos
+    without the driver registered fall back to git's default merge gracefully.
+    """
+    actions: list[str] = []
+    driver_cmd = f"{_find_kin_path()} merge-kin %O %A %B %P"
+    for key, value in (
+        ("merge.kindex.name", "Kindex .kin artifact structured merge"),
+        ("merge.kindex.driver", driver_cmd),
+    ):
+        if dry_run:
+            actions.append(f"[dry-run] git config {key} = {value}")
+            continue
+        subprocess.run(["git", "-C", str(root), "config", key, value],
+                       capture_output=True, text=True, timeout=5)
+        actions.append(f"git config {key} = {value}")
+
+    attrs_path = root / ".gitattributes"
+    existing = attrs_path.read_text().splitlines() if attrs_path.exists() else []
+    have = {line.strip() for line in existing}
+    missing = [a for a in _KIN_MERGE_ATTRS if a not in have]
+    if not missing:
+        actions.append(f".gitattributes already current ({attrs_path})")
+        return actions
+    if dry_run:
+        actions.append(f"[dry-run] add to .gitattributes: {missing}")
+        return actions
+    lines = list(existing)
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.append(_KIN_MERGE_ATTR_HEADER)
+    lines.extend(missing)
+    attrs_path.write_text("\n".join(lines) + "\n")
+    actions.append(f"updated {attrs_path} (+{len(missing)} entries)")
+    return actions
+
+
+def uninstall_merge_driver(root: "Path", dry_run: bool = False) -> list[str]:
+    """Remove the merge driver config and ``.gitattributes`` entries."""
+    actions: list[str] = []
+    if dry_run:
+        actions.append("[dry-run] git config --remove-section merge.kindex")
+    else:
+        r = subprocess.run(
+            ["git", "-C", str(root), "config", "--remove-section", "merge.kindex"],
+            capture_output=True, text=True, timeout=5,
+        )
+        actions.append(
+            "removed git config section merge.kindex" if r.returncode == 0
+            else "git config section merge.kindex not present"
+        )
+    attrs_path = root / ".gitattributes"
+    if attrs_path.exists():
+        drop = set(_KIN_MERGE_ATTRS) | {_KIN_MERGE_ATTR_HEADER}
+        kept = [ln for ln in attrs_path.read_text().splitlines() if ln.strip() not in drop]
+        if dry_run:
+            actions.append(f"[dry-run] strip kindex entries from {attrs_path}")
+        elif any(ln.strip() for ln in kept):
+            attrs_path.write_text("\n".join(kept).rstrip() + "\n")
+            actions.append(f"stripped kindex entries from {attrs_path}")
+        else:
+            attrs_path.write_text("")
+            actions.append(f"cleared {attrs_path}")
+    return actions
